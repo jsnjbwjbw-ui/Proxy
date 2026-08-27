@@ -1,16 +1,15 @@
-"""Universal AI Proxy  v9.0
+"""Universal AI Proxy  v10.0
 =========================
-التحسينات الجديدة:
-  ① DeepSeek: Fallback تلقائي عند خطأ "الخادم مشغول"
-      - محاولة أولى: محادثة جديدة بنفس الوضع
-      - محاولة ثانية: تغيير الوضع (expert↔default) + محادثة جديدة
-  ② Regenerate: كشف طلب regenerate → إنشاء محادثة جديدة لكل النماذج
-  ③ Qwen Proxy: نظام proxy ذكي
-      - يستخدم proxy فقط لـ Qwen
-      - ينتقل للبروكسي التالي فقط عند HTTP 403/429 (حظر)
-      - يحتفظ بنفس البروكسي لنفس المحادثة (session sticky)
-      - لا ينتقل عند أخطاء الشبكة العادية
-  ④ Qwen Images: دعم رفع الصور (حتى 5 صور) عبر OSS وإرسالها في المحادثة
+التحسينات الجديدة عن v9:
+  ① إصلاح Tool Call: استخراج الأداة حتى لو كانت مدفونة في نص عادي
+      - parse_tool_call تبحث في كامل النص (re.search بدل re.match)
+      - has_tool_call() مساعدة تكشف وجود أداة في أي مكان
+      - clean_text() لا تُشغَّل إذا وُجدت أداة
+  ② دعم الصور (Vision/Multimodal):
+      - رفع الصور لـ Qwen OSS تلقائياً
+      - قبول image_url في messages بصيغة OpenAI
+      - /v1/models يُعلن vision: true لنموذج qwen
+      - capabilities endpoint جديد
 """
 
 from __future__ import annotations
@@ -51,20 +50,14 @@ log = logging.getLogger("ai_proxy")
 
 PROXY_FILE = os.environ.get("PROXY_FILE", "proxies.txt")
 
-class QwenProxyManager:
-    """
-    يدير قائمة البروكسيات لـ Qwen.
-    - sticky per session: نفس المحادثة تستخدم نفس البروكسي
-    - يتبدل فقط عند HTTP 403/429 (حظر IP)
-    - يسجّل البروكسيات المحظورة ويتجنبها
-    """
 
+class QwenProxyManager:
     def __init__(self):
-        self._proxies: List[str] = []      # "http://user:pass@host:port"
-        self._banned: set = set()           # proxies محظورة
-        self._idx = 0                       # index الحالي (round-robin أولي)
+        self._proxies: List[str] = []
+        self._banned: set = set()
+        self._idx = 0
         self._lock = asyncio.Lock()
-        self._session_proxy: Dict[str, str] = {}  # conv_id → proxy_url
+        self._session_proxy: Dict[str, str] = {}
         self._load()
 
     def _load(self):
@@ -76,7 +69,6 @@ class QwenProxyManager:
                 line = line.strip()
                 if not line or line.startswith('#'):
                     continue
-                # صيغة: user:pass@host:port  أو  http://user:pass@host:port
                 if not line.startswith("http"):
                     line = "http://" + line
                 self._proxies.append(line)
@@ -90,7 +82,6 @@ class QwenProxyManager:
         return [p for p in self._proxies if p not in self._banned]
 
     async def get_for_session(self, conv_id: str) -> Optional[str]:
-        """إرجاع البروكسي المخصص للمحادثة، أو تعيين واحد جديد"""
         async with self._lock:
             if not self._proxies:
                 return None
@@ -104,20 +95,14 @@ class QwenProxyManager:
                 p = self._session_proxy[conv_id]
                 if p in avail:
                     return p
-                # البروكسي القديم محظور → نعيّن جديد
                 log.info("ProxyManager: session %s proxy was banned, reassigning", conv_id[:16])
 
-            # اختيار round-robin من المتاح
             p = avail[self._idx % len(avail)]
             self._idx += 1
             self._session_proxy[conv_id] = p
             return p
 
     async def mark_banned(self, proxy_url: str, conv_id: str) -> Optional[str]:
-        """
-        يُعلّم البروكسي كمحظور ويُعيّن بروكسي جديد للمحادثة.
-        يُستدعى فقط عند HTTP 403/429 من Qwen.
-        """
         async with self._lock:
             if proxy_url in self._proxies:
                 self._banned.add(proxy_url)
@@ -179,7 +164,6 @@ async def _update_session(token: str, conv_id: str, **kwargs) -> None:
 
 
 async def _clear_session(token: str, conv_id: str) -> None:
-    """حذف الجلسة لإجبار إنشاء محادثة جديدة"""
     async with _session_lock:
         key = _session_key(token, conv_id)
         if key in _sessions:
@@ -213,13 +197,6 @@ def _compute_conv_id(
 
 
 def _is_regenerate_request(body: Dict) -> bool:
-    """
-    كشف إذا كان الطلب regenerate.
-    Open Minis يرسل عادةً:
-      - "regenerate": true
-      - أو "action": "regenerate"
-      - أو "resend": true
-    """
     if body.get("regenerate") or body.get("resend"):
         return True
     if body.get("action") in ("regenerate", "resend", "retry"):
@@ -228,6 +205,286 @@ def _is_regenerate_request(body: Dict) -> bool:
     if extra.get("regenerate") or extra.get("action") in ("regenerate", "resend"):
         return True
     return False
+
+
+# ══════════════════════════════════════════════════════════
+# ① إصلاح Tool Call — المنطق المحسّن
+# ══════════════════════════════════════════════════════════
+
+def _has_tool_call(text: str) -> bool:
+    """كشف سريع: هل يوجد استدعاء أداة في النص؟"""
+    if re.search(r'ACTION:\s*\w+\|\s*\{', text):
+        return True
+    if re.search(r'<tool_call>', text, re.IGNORECASE):
+        return True
+    if re.search(r'<name>.*?</name>', text, re.IGNORECASE | re.DOTALL):
+        return True
+    return False
+
+
+def parse_tool_call(text: str) -> Optional[Dict]:
+    """
+    يبحث عن استدعاء الأداة في أي مكان من النص (مدفون أو منفرد).
+    ← التغيير الجوهري: re.search بدلاً من re.match أو (?m)^
+    """
+    # صيغة ACTION (في أي مكان من النص)
+    m = re.search(r'ACTION:\s*(\w+)\|\s*(\{.*?\})', text, re.DOTALL)
+    if m:
+        return _make_tc(m.group(1), m.group(2))
+
+    # صيغة <tool_call>
+    m = re.search(
+        r'<tool_call>\s*<name>(.*?)</name>\s*<arguments>(.*?)</arguments>\s*</tool_call>',
+        text, re.DOTALL | re.IGNORECASE,
+    )
+    if m:
+        return _make_tc(m.group(1), m.group(2))
+
+    # صيغة <name> + <parameter>
+    m_name   = re.search(r'<name>(.*?)</name>', text, re.IGNORECASE)
+    m_params = re.findall(
+        r'<parameter[=:](\w+)>\s*(.*?)\s*</parameter>',
+        text, re.DOTALL | re.IGNORECASE,
+    )
+    if m_name and m_params:
+        params = {p: v for p, v in m_params}
+        return _make_tc(m_name.group(1).strip(), json.dumps(params, ensure_ascii=False))
+
+    return None
+
+
+def _make_tc(name: str, args_raw: str) -> Dict:
+    name = name.strip()
+    try:
+        args_obj = json.loads(args_raw)
+    except json.JSONDecodeError:
+        try:
+            args_obj = json.loads(args_raw.replace("'", '"'))
+        except Exception:
+            args_obj = {"raw": args_raw.strip()}
+    return {"name": name, "arguments": json.dumps(args_obj, ensure_ascii=False)}
+
+
+def clean_text(text: str) -> str:
+    """يُزيل أجزاء الأداة من النص — لا يُستدعى إذا وُجدت أداة."""
+    text = re.sub(r'ACTION:\s*\S+\|.*?(?=\n|$)', '', text, flags=re.DOTALL)
+    text = re.sub(r'<tool_call>.*?</tool_call>', '', text, flags=re.DOTALL | re.IGNORECASE)
+    text = re.sub(r'</?function[^>]*>', '', text, flags=re.IGNORECASE)
+    return text.strip()
+
+
+# ══════════════════════════════════════════════════════════
+# ② OSS Upload — رفع الصور إلى Qwen (مستلهم من Discord bot)
+# ══════════════════════════════════════════════════════════
+
+QWEN_BASE          = "https://chat.qwen.ai/api/v2"
+QWEN_MODEL_ID_REAL = "qwen3.8-max"
+
+_UA_APP = (
+    "Dalvik/2.1.0 (Linux; U; Android 15; RMX3834 Build/AP3A.240905.015.A2) "
+    "AliApp(QWENCHAT/2.7.2) AppType/Release AplusBridgeLite"
+)
+
+
+def _oss_signature(secret_key: str, method: str, content_md5: str,
+                   content_type: str, date: str,
+                   canonical_headers: str, canonical_resource: str) -> str:
+    string_to_sign = (
+        f"{method}\n{content_md5}\n{content_type}\n{date}\n"
+        f"{canonical_headers}{canonical_resource}"
+    )
+    h = hmac.new(secret_key.encode(), string_to_sign.encode(), hashlib.sha1)
+    return base64.b64encode(h.digest()).decode()
+
+
+async def _qwen_upload_image_oss(
+    token: str,
+    image_bytes: bytes,
+    client: httpx.AsyncClient,
+    filename: Optional[str] = None,
+) -> Dict:
+    """
+    رفع صورة إلى Qwen OSS وإرجاع payload الملف جاهزاً للإرسال.
+    يتبع نفس منطق Discord bot بالضبط.
+    """
+    if not filename:
+        filename = f"{uuid.uuid4()}_IMG.jpg"
+
+    file_size = str(len(image_bytes))
+
+    # ── 1. الحصول على STS token
+    sts_url = f"{QWEN_BASE}/files/getstsToken"
+    sts_headers = {
+        "User-Agent": _UA_APP,
+        "Content-Type": "application/json",
+        "Authorization": f"Bearer {token}",
+        "x-device-id": "0",
+        "source": "app",
+        "x-request-id": str(uuid.uuid4()),
+        "Cookie": f"x-ap=eu-central-1; token={token}",
+    }
+    payload = {"filename": filename, "filetype": "image", "filesize": file_size}
+    r = await client.post(sts_url, json=payload, headers=sts_headers, timeout=60)
+    res = r.json()
+
+    if "data" not in res:
+        raise HTTPException(status_code=502, detail=f"Qwen OSS STS failed: {res}")
+
+    sts = res["data"]
+    access_key_id     = sts["access_key_id"]
+    access_key_secret = sts["access_key_secret"]
+    security_token    = sts["security_token"]
+    file_path         = sts["file_path"]
+    file_id           = sts["file_id"]
+    bucket            = sts["bucketname"]
+    host              = f"{bucket}.{sts['endpoint']}"
+    canon_sec_header  = f"x-oss-security-token:{security_token}\n"
+
+    def _gmt() -> str:
+        return datetime.now(timezone.utc).strftime('%a, %d %b %Y %H:%M:%S GMT')
+
+    def _oss_base_headers(method: str, content_md5: str, content_type: str,
+                           canon_resource: str, content_length: str = "0") -> Dict:
+        gmt = _gmt()
+        sig = _oss_signature(access_key_secret, method, content_md5, content_type,
+                              gmt, canon_sec_header, canon_resource)
+        return {
+            "Authorization":       f"OSS {access_key_id}:{sig}",
+            "User-Agent":          "aliyun-sdk-android/2.9.21",
+            "Host":                host,
+            "x-oss-security-token": security_token,
+            "Date":                gmt,
+            "Content-Type":        content_type,
+            "Content-Length":      content_length,
+        }
+
+    # ── 2. Initiate multipart upload
+    init_url = f"https://{host}/{file_path}?uploads"
+    init_hdrs = _oss_base_headers("POST", "", "image/jpeg", f"/{bucket}/{file_path}?uploads")
+    init_r = await client.post(init_url, headers=init_hdrs, timeout=60)
+    root = ET.fromstring(init_r.text)
+    upload_id = root.find('{*}UploadId').text
+
+    # ── 3. رفع الجزء الوحيد
+    content_md5 = base64.b64encode(hashlib.md5(image_bytes).digest()).decode()
+    part_url  = f"https://{host}/{file_path}?uploadId={upload_id}&partNumber=1"
+    part_res  = f"/{bucket}/{file_path}?partNumber=1&uploadId={upload_id}"
+    part_hdrs = _oss_base_headers("PUT", content_md5, "image/jpeg", part_res, file_size)
+    part_hdrs["Content-MD5"] = content_md5
+    pr = await client.put(part_url, content=image_bytes, headers=part_hdrs, timeout=120)
+    etag = pr.headers.get("ETag", "").replace('"', '')
+
+    # ── 4. Complete multipart upload
+    complete_body = (
+        f"<CompleteMultipartUpload>"
+        f"<Part><PartNumber>1</PartNumber><ETag>{etag}</ETag></Part>"
+        f"</CompleteMultipartUpload>"
+    )
+    complete_url = f"https://{host}/{file_path}?uploadId={upload_id}"
+    comp_res = f"/{bucket}/{file_path}?uploadId={upload_id}"
+    comp_hdrs = _oss_base_headers("POST", "", "image/jpeg", comp_res,
+                                   str(len(complete_body)))
+    await client.post(complete_url, content=complete_body.encode(), headers=comp_hdrs, timeout=60)
+
+    signed_url = sts.get("file_url", f"https://{host}/{file_path}")
+    log.info("OSS upload OK: file_id=%s url=%s", file_id, signed_url[:60])
+
+    return {
+        "type":     "image",
+        "file":     {"data": {}, "filename": filename, "id": file_id, "meta": {"name": filename}},
+        "id":       file_id,
+        "filename": filename,
+        "name":     filename,
+        "url":      signed_url,
+        "image_width":  1024,
+        "image_height": 1024,
+    }
+
+
+# ══════════════════════════════════════════════════════════
+# ② استخراج الصور من messages بصيغة OpenAI
+# ══════════════════════════════════════════════════════════
+
+def _extract_images_from_messages(messages: List[Dict]) -> Tuple[List[Dict], List[Dict]]:
+    """
+    يفحص messages ويُخرج:
+      - messages_clean: نفس الرسائل لكن content الصور أصبح نص فقط [IMAGE]
+      - image_items: قائمة بالصور {data: bytes, filename: str, msg_index: int}
+    """
+    image_items: List[Dict] = []
+    messages_clean = []
+
+    for msg in messages:
+        role    = msg.get("role", "user")
+        content = msg.get("content", "")
+
+        if isinstance(content, list):
+            text_parts = []
+            for part in content:
+                if not isinstance(part, dict):
+                    continue
+                ptype = part.get("type", "")
+                if ptype == "text":
+                    text_parts.append(part.get("text", ""))
+                elif ptype == "image_url":
+                    img_url_obj = part.get("image_url", {})
+                    url = img_url_obj.get("url", "") if isinstance(img_url_obj, dict) else str(img_url_obj)
+                    fname = f"img_{len(image_items)}_{uuid.uuid4().hex[:6]}.jpg"
+                    if url.startswith("data:"):
+                        # base64 inline
+                        try:
+                            header, b64 = url.split(",", 1)
+                            raw = base64.b64decode(b64)
+                            image_items.append({"data": raw, "filename": fname, "url_type": "base64"})
+                            text_parts.append(f"[IMAGE:{fname}]")
+                        except Exception as e:
+                            log.warning("Failed to decode base64 image: %s", e)
+                            text_parts.append("[IMAGE:decode_error]")
+                    elif url.startswith("http"):
+                        image_items.append({"data": None, "url": url, "filename": fname, "url_type": "remote"})
+                        text_parts.append(f"[IMAGE:{fname}]")
+                    else:
+                        text_parts.append("[IMAGE:unknown]")
+
+            clean_msg = dict(msg)
+            clean_msg["content"] = " ".join(text_parts)
+            messages_clean.append(clean_msg)
+        else:
+            messages_clean.append(dict(msg))
+
+    return messages_clean, image_items
+
+
+async def _resolve_images(
+    image_items: List[Dict],
+    token: str,
+    client: httpx.AsyncClient,
+) -> List[Dict]:
+    """
+    يُحمّل الصور البعيدة إذا لزم ثم يرفعها لـ Qwen OSS.
+    يُرجع قائمة file_payload جاهزة للـ Qwen messages.
+    """
+    uploaded = []
+    for item in image_items:
+        raw = item.get("data")
+        if raw is None and item.get("url_type") == "remote":
+            # تحميل الصورة من الرابط
+            try:
+                r = await client.get(item["url"], timeout=60,
+                                     follow_redirects=True,
+                                     headers={"User-Agent": "Mozilla/5.0"})
+                r.raise_for_status()
+                raw = r.content
+            except Exception as e:
+                log.warning("Failed to download image %s: %s", item.get("url", ""), e)
+                continue
+        if raw:
+            try:
+                fp = await _qwen_upload_image_oss(token, raw, client, item["filename"])
+                uploaded.append(fp)
+            except Exception as e:
+                log.warning("Failed to upload image to OSS: %s", e)
+    return uploaded
 
 
 # ══════════════════════════════════════════════════════════
@@ -383,46 +640,6 @@ def build_full_prompt(messages: List[Dict], tools: List[Dict]) -> str:
     return "\n\n".join(parts)
 
 
-def parse_tool_call(text: str) -> Optional[Dict]:
-    m = re.search(r"(?m)^ACTION:\s*(\w+)\|(\{.*\})\s*$", text, re.DOTALL)
-    if m:
-        return _make_tc(m.group(1), m.group(2))
-    m = re.search(
-        r"<tool_call>\s*<name>(.*?)</name>\s*<arguments>(.*?)</arguments>\s*</tool_call>",
-        text, re.DOTALL | re.IGNORECASE,
-    )
-    if m:
-        return _make_tc(m.group(1), m.group(2))
-    m_name   = re.search(r"<name>(.*?)</name>", text, re.IGNORECASE)
-    m_params = re.findall(
-        r"<parameter[=:](\w+)>\s*(.*?)\s*</parameter>",
-        text, re.DOTALL | re.IGNORECASE,
-    )
-    if m_name and m_params:
-        params = {p: v for p, v in m_params}
-        return _make_tc(m_name.group(1).strip(), json.dumps(params, ensure_ascii=False))
-    return None
-
-
-def _make_tc(name: str, args_raw: str) -> Dict:
-    name = name.strip()
-    try:
-        args_obj = json.loads(args_raw)
-    except json.JSONDecodeError:
-        try:
-            args_obj = json.loads(args_raw.replace("'", '"'))
-        except Exception:
-            args_obj = {"raw": args_raw.strip()}
-    return {"name": name, "arguments": json.dumps(args_obj, ensure_ascii=False)}
-
-
-def clean_text(text: str) -> str:
-    text = re.sub(r"(?m)^ACTION:\s*\S+\|.*$", "", text)
-    text = re.sub(r"<tool_call>.*?</tool_call>", "", text, flags=re.DOTALL | re.IGNORECASE)
-    text = re.sub(r"</?function[^>]*>", "", text, flags=re.IGNORECASE)
-    return text.strip()
-
-
 def make_tc_response(tc: Dict, model: str) -> Dict:
     call_id = f"call_{uuid.uuid4().hex[:24]}"
     return {
@@ -469,16 +686,12 @@ def sse_chunk(
 
 
 # ══════════════════════════════════════════════════════════
-# BACKEND 1: Qwen (مع دعم Proxy)
+# BACKEND 1: Qwen (مع دعم Proxy + Vision)
 # ══════════════════════════════════════════════════════════
 
-QWEN_BASE          = "https://chat.qwen.ai/api/v2"
-QWEN_MODEL_ID_REAL = "qwen3.8-max"
-QWEN_PROXY_ID      = "qwen"
-REQUEST_TIMEOUT    = 180
-
-# أكواد HTTP التي تعني حظر IP (ننتقل للبروكسي التالي)
-QWEN_BAN_CODES = {403, 429, 451}
+QWEN_PROXY_ID   = "qwen"
+REQUEST_TIMEOUT = 180
+QWEN_BAN_CODES  = {403, 429, 451}
 
 _UA_CHAT = (
     "Dalvik/2.1.0 (Linux; U; Android 15; RMX3834 Build/AP3A.240905.015.A2) "
@@ -535,7 +748,6 @@ def _qwen_is_antibot(line: str) -> bool:
 
 
 def _make_qwen_client(proxy_url: Optional[str] = None) -> httpx.AsyncClient:
-    """إنشاء httpx client مع أو بدون proxy"""
     if proxy_url:
         return httpx.AsyncClient(proxies={"http://": proxy_url, "https://": proxy_url})
     return httpx.AsyncClient()
@@ -545,7 +757,6 @@ async def _qwen_create_chat(token: str, client: httpx.AsyncClient) -> str:
     url     = f"{QWEN_BASE}/chats/new"
     payload = {"chat_mode": "normal", "project_id": ""}
     resp    = await client.post(url, json=payload, headers=_qwen_headers_new(token), timeout=60)
-    # فحص حظر IP
     if resp.status_code in QWEN_BAN_CODES:
         raise BannedProxyError(f"HTTP {resp.status_code}")
     data    = resp.json()
@@ -558,12 +769,14 @@ async def _qwen_create_chat(token: str, client: httpx.AsyncClient) -> str:
 
 
 class BannedProxyError(Exception):
-    """يُرفع عند حظر البروكسي (403/429/451)"""
     pass
 
 
-def _qwen_build_payload(chat_id, prompt, parent_id, *, chat_type="t2t", thinking=False,
-                         auto_search=False, files=None, size="1:1") -> Dict:
+def _qwen_build_payload(
+    chat_id, prompt, parent_id, *,
+    chat_type="t2t", thinking=False,
+    auto_search=False, files=None, size="1:1",
+) -> Dict:
     ts  = int(time.time())
     fid = str(uuid.uuid4())
     return {
@@ -590,10 +803,6 @@ async def _qwen_stream_collect(
     payload: Dict,
     client: httpx.AsyncClient,
 ) -> Tuple[str, Optional[str], bool]:
-    """
-    يُرجع: (full_text, last_response_id, was_banned)
-    was_banned = True إذا تلقينا HTTP ban code
-    """
     url      = f"{QWEN_BASE}/chat/completions"
     full_txt = ""
     resp_id: Optional[str] = None
@@ -605,7 +814,6 @@ async def _qwen_stream_collect(
             headers=_qwen_headers_chat(token, stream=True),
             params={"chat_id": chat_id}, timeout=REQUEST_TIMEOUT,
         ) as resp:
-            # فحص حظر IP أولاً
             if resp.status_code in QWEN_BAN_CODES:
                 log.warning("Qwen: HTTP %d → proxy banned", resp.status_code)
                 return "", None, True
@@ -645,205 +853,10 @@ async def _qwen_stream_collect(
                     continue
 
     except httpx.ProxyError as e:
-        log.warning("Qwen: ProxyError → %s (proxy connection failed)", e)
-        # خطأ اتصال بالبروكسي — لا يعني حظراً بالضرورة
-        # نُرجع نصاً فارغاً بدون علامة حظر
+        log.warning("Qwen: ProxyError → %s", e)
         return "", None, False
 
     return full_txt, resp_id, was_banned
-
-
-# ══════════════════════════════════════════════════════════
-# Qwen Image Upload (OSS)
-# ══════════════════════════════════════════════════════════
-
-def _oss_generate_signature(secret_key: str, method: str, content_md5: str,
-                            content_type: str, date: str, canonical_headers: str,
-                            canonical_resource: str) -> str:
-    string_to_sign = f"{method}\n{content_md5}\n{content_type}\n{date}\n{canonical_headers}{canonical_resource}"
-    h = hmac.new(secret_key.encode('utf-8'), string_to_sign.encode('utf-8'), hashlib.sha1)
-    return base64.b64encode(h.digest()).decode('utf-8')
-
-
-async def _qwen_get_sts_token(token: str, client: httpx.AsyncClient,
-                              filename: str, filesize: int) -> Dict:
-    """طلب صلاحية رفع لملف صورة من Qwen OSS"""
-    url     = f"{QWEN_BASE}/files/getstsToken"
-    payload = {"filename": filename, "filetype": "image", "filesize": str(filesize)}
-    headers = _qwen_headers_new(token)  # بدون stream
-    headers["x-request-id"] = str(uuid.uuid4())
-    resp = await client.post(url, json=payload, headers=headers, timeout=60)
-    if resp.status_code in QWEN_BAN_CODES:
-        raise BannedProxyError(f"STS HTTP {resp.status_code}")
-    data = resp.json()
-    if _qwen_is_rate_limited(data):
-        raise HTTPException(status_code=429, detail="Qwen rate limited during STS token")
-    if "data" not in data:
-        raise HTTPException(status_code=502, detail=f"STS token failed: {data}")
-    return data["data"]
-
-
-async def _oss_upload_image(sts_data: Dict, image_bytes: bytes, client: httpx.AsyncClient) -> Dict:
-    """
-    ينفذ رفع صورة إلى OSS متعدد الأجزاء (init, put, complete)
-    ويعيد معلومات الملف المرفوع.
-    """
-    access_key_id     = sts_data["access_key_id"]
-    access_key_secret = sts_data["access_key_secret"]
-    security_token    = sts_data["security_token"]
-    file_path         = sts_data["file_path"]
-    file_id           = sts_data["file_id"]
-    bucket            = sts_data["bucketname"]
-    host              = f"{bucket}.{sts_data['endpoint']}"
-    file_url          = sts_data.get("file_url", f"https://{host}/{file_path}")
-
-    # 1) Initiate multipart upload
-    init_url = f"https://{host}/{file_path}?uploads"
-    gmt_date = datetime.now(timezone.utc).strftime('%a, %d %b %Y %H:%M:%S GMT')
-    canon_headers = f"x-oss-security-token:{security_token}\n"
-    canon_resource = f"/{bucket}/{file_path}?uploads"
-    signature = _oss_generate_signature(access_key_secret, "POST", "", "image/jpeg",
-                                        gmt_date, canon_headers, canon_resource)
-    init_headers = {
-        'Authorization': f'OSS {access_key_id}:{signature}',
-        'User-Agent': 'aliyun-sdk-android/2.9.21',
-        'Host': host,
-        'x-oss-security-token': security_token,
-        'Date': gmt_date,
-        'Content-Type': 'image/jpeg',
-        'Content-Length': '0',
-    }
-    resp = await client.post(init_url, headers=init_headers, timeout=60)
-    if resp.status_code != 200:
-        raise HTTPException(status_code=502, detail=f"OSS init failed: {resp.text}")
-    root = ET.fromstring(resp.text)
-    upload_id_elem = root.find('{*}UploadId')
-    if upload_id_elem is None:
-        upload_id_elem = root.find('UploadId')
-    upload_id = upload_id_elem.text
-
-    # 2) Upload the single part
-    part_url = f"https://{host}/{file_path}?uploadId={upload_id}&partNumber=1"
-    gmt_date = datetime.now(timezone.utc).strftime('%a, %d %b %Y %H:%M:%S GMT')
-    content_md5 = base64.b64encode(hashlib.md5(image_bytes).digest()).decode('utf-8')
-    canon_resource = f"/{bucket}/{file_path}?partNumber=1&uploadId={upload_id}"
-    signature = _oss_generate_signature(access_key_secret, "PUT", content_md5, "image/jpeg",
-                                        gmt_date, canon_headers, canon_resource)
-    part_headers = {
-        'Authorization': f'OSS {access_key_id}:{signature}',
-        'User-Agent': 'aliyun-sdk-android/2.9.21',
-        'Host': host,
-        'x-oss-security-token': security_token,
-        'Date': gmt_date,
-        'Content-MD5': content_md5,
-        'Content-Type': 'image/jpeg',
-        'Content-Length': str(len(image_bytes)),
-    }
-    resp = await client.put(part_url, content=image_bytes, headers=part_headers, timeout=120)
-    if resp.status_code != 200:
-        raise HTTPException(status_code=502, detail=f"OSS upload part failed: {resp.text}")
-    etag = resp.headers.get("ETag", "").replace('"', '')
-
-    # 3) Complete multipart upload
-    complete_url = f"https://{host}/{file_path}?uploadId={upload_id}"
-    gmt_date = datetime.now(timezone.utc).strftime('%a, %d %b %Y %H:%M:%S GMT')
-    complete_body = f"<CompleteMultipartUpload><Part><PartNumber>1</PartNumber><ETag>{etag}</ETag></Part></CompleteMultipartUpload>"
-    canon_resource = f"/{bucket}/{file_path}?uploadId={upload_id}"
-    signature = _oss_generate_signature(access_key_secret, "POST", "", "image/jpeg",
-                                        gmt_date, canon_headers, canon_resource)
-    complete_headers = {
-        'Authorization': f'OSS {access_key_id}:{signature}',
-        'User-Agent': 'aliyun-sdk-android/2.9.21',
-        'Host': host,
-        'x-oss-security-token': security_token,
-        'Date': gmt_date,
-        'Content-Type': 'image/jpeg',
-        'Content-Length': str(len(complete_body)),
-    }
-    resp = await client.post(complete_url, content=complete_body.encode('utf-8'),
-                             headers=complete_headers, timeout=60)
-    # قد يكون 200 أو 204
-    if resp.status_code not in (200, 201, 204):
-        # بعض الأحيان يكون 200 مع XML نجاح، نتجاهل الخطأ البسيط
-        pass
-
-    return {
-        "type": "image",
-        "file": {"data": {}, "filename": os.path.basename(file_path), "id": file_id,
-                 "meta": {"name": os.path.basename(file_path)}},
-        "id": file_id,
-        "filename": os.path.basename(file_path),
-        "name": os.path.basename(file_path),
-        "url": file_url,
-    }
-
-
-async def _upload_image_to_qwen_oss(token: str, image_bytes: bytes,
-                                    client: httpx.AsyncClient) -> Dict:
-    """الواجهة العليا لرفع صورة واحدة إلى Qwen وإرجاع كائن الملف"""
-    filename = f"{uuid.uuid4()}_IMG.jpg"
-    sts_data = await _qwen_get_sts_token(token, client, filename, len(image_bytes))
-    return await _oss_upload_image(sts_data, image_bytes, client)
-
-
-# ══════════════════════════════════════════════════════════
-# استخراج الصور من رسائل OpenAI
-# ══════════════════════════════════════════════════════════
-
-def _extract_images_and_text_from_messages(messages: List[Dict]) -> Tuple[List[bytes], List[Dict]]:
-    """
-    يفحص الرسائل، يستخرج الصور (base64 أو روابط) من رسائل المستخدم
-    ويعيد (قائمة بايتات الصور، الرسائل بعد استبدال الصور بعلامة [IMAGE] في النص).
-    الحد الأقصى للصور هو 5 (بدون قيد حجم).
-    """
-    MAX_IMAGES = 5
-    images: List[bytes] = []
-    new_messages = []
-    for m in messages:
-        if m.get("role") != "user":
-            new_messages.append(m)
-            continue
-        content = m.get("content")
-        if isinstance(content, list):
-            # محتوى متعدد: نبحث عن نصوص وصور
-            text_parts = []
-            for part in content:
-                if part.get("type") == "text":
-                    text_parts.append(part.get("text", ""))
-                elif part.get("type") == "image_url":
-                    if len(images) >= MAX_IMAGES:
-                        log.warning("تجاوز عدد الصور المسموح (5) - تم تجاهل الصورة الزائدة")
-                        continue
-                    image_url = part.get("image_url", {}).get("url", "")
-                    if image_url.startswith("data:"):
-                        # data URI مثل data:image/jpeg;base64,xxxx
-                        try:
-                            header, b64data = image_url.split(",", 1)
-                            img_bytes = base64.b64decode(b64data)
-                            images.append(img_bytes)
-                        except Exception:
-                            log.error("فشل فك ترميز صورة base64")
-                            continue
-                    else:
-                        # رابط http(s) - سنقوم بتحميله لاحقاً بشكل غير متزامن،
-                        # لكن هنا نضيف علامة [IMAGE] فقط ونؤجل التحميل.
-                        # لتبسيط الكود، نضع bytes فارغة مؤقتاً ونحمل خارجياً.
-                        # لكننا سنحتاج التحميل الفعلي في الـ backend.
-                        # لذلك سنضيف علامة مميزة، وسنعالج التحميل في QwenBackend.
-                        # سنستخدم هنا فقط علامة [IMAGE]، وسنستخرج الروابط لاحقاً.
-                        # سنخزن الرابط في قائمة خاصة.
-                        # سنبقي image_url كما هو، وسنعالجه في الدالة الرئيسية.
-                        # لذلك نضيف العنصر كما هو، وسنقوم في QwenBackend بفحصه.
-                        images.append(image_url)  # سنميز لاحقاً
-            # نستبدل content بنص يحتوي على [IMAGE] لكل صورة
-            new_content = " ".join(text_parts)
-            if images:
-                new_content += " " + " ".join(["[IMAGE]"] * len(images))
-            new_m = {**m, "content": new_content}
-            new_messages.append(new_m)
-        else:
-            new_messages.append(m)
-    return images, new_messages
 
 
 class QwenBackend(BaseBackend):
@@ -852,60 +865,15 @@ class QwenBackend(BaseBackend):
         return QWEN_PROXY_ID
 
     async def complete(self, token, messages, tools, thinking, conv_id, extra) -> AsyncIterator[str]:
-        # 1) استخراج الصور من الرسائل (base64 أو روابط)
-        raw_images, processed_messages = _extract_images_and_text_from_messages(messages)
-        # تحويل أي روابط إلى bytes إذا كانت موجودة
-        images_bytes = []
-        for img in raw_images:
-            if isinstance(img, bytes):
-                images_bytes.append(img)
-            elif isinstance(img, str):
-                # رابط صورة، نحمّله الآن (غير متزامن) - سنحتاج دالة تحميل
-                # نستخدم httpx داخل الكود، لكننا هنا بدون client، لذا سننشئ واحد
-                try:
-                    async with httpx.AsyncClient() as tmp_client:
-                        resp = await tmp_client.get(img, timeout=30)
-                        resp.raise_for_status()
-                        images_bytes.append(resp.content)
-                except Exception as e:
-                    log.error(f"فشل تحميل صورة من الرابط {img[:50]}...: {e}")
-
-        if len(images_bytes) > 5:
-            images_bytes = images_bytes[:5]
-            log.warning("تم تقليص الصور إلى 5 كحد أقصى")
-
-        prompt = build_full_prompt(processed_messages, tools)
+        # ── ② استخراج الصور من messages
+        messages_clean, image_items = _extract_images_from_messages(messages)
+        prompt = build_full_prompt(messages_clean, tools)
         if not prompt.strip():
             return
         await _evict_old_sessions()
 
-        # 2) رفع الصور إلى Qwen OSS (خارج حلقة البروكسي)
-        uploaded_files = []
-        if images_bytes:
-            # سنستخدم نفس العميل لرفع جميع الصور، لكن يجب أن نستخدم البروكسي الحالي
-            # لذلك نؤجل الرفع داخل حلقة البروكسي لاستخدام نفس البروكسي.
-            # سنضع الرفع داخل الحلقة بعد جلب البروكسي، ونمرر files إلى payload.
-            # لكن لتبسيط، سنقوم بالرفع الآن بمجرد وجود images، وسننشئ client بدون proxy.
-            # الأفضل: نجعل الرفع داخل حلقة المحاولات، لكن مع استثناء إذا فشل ننتقل للبروكسي التالي.
-            # سنقوم بتعديل لاحق. حالياً نرفع بدون proxy.
-            try:
-                async with _make_qwen_client(None) as upload_client:
-                    for img_bytes in images_bytes:
-                        file_obj = await _upload_image_to_qwen_oss(token, img_bytes, upload_client)
-                        uploaded_files.append(file_obj)
-            except HTTPException as e:
-                yield sse_chunk(f"[Qwen Upload Error: {e.detail}]", model=self.model_id)
-                yield sse_chunk(model=self.model_id, finish=True)
-                yield "data: [DONE]\n\n"
-                return
-            except BannedProxyError:
-                # لن يحدث لأننا بدون proxy
-                pass
-
-        # 3) محاولات الإرسال مع البروكسي (مع إمكانية إعادة المحاولة عند الحظر)
         MAX_PROXY_RETRIES = 3
-        qwen_text = ""
-        last_rid = None
+        uploaded_files: List[Dict] = []
 
         for attempt in range(MAX_PROXY_RETRIES + 1):
             proxy_url = await proxy_manager.get_for_session(conv_id) if proxy_manager.enabled else None
@@ -918,6 +886,15 @@ class QwenBackend(BaseBackend):
                 try:
                     async with _make_qwen_client(proxy_url) as tmp:
                         qwen_chat_id = await _qwen_create_chat(token, tmp)
+
+                        # ── رفع الصور عند إنشاء المحادثة (مرة واحدة فقط)
+                        if image_items and not uploaded_files:
+                            try:
+                                uploaded_files = await _resolve_images(image_items, token, tmp)
+                                log.info("Qwen: uploaded %d image(s) to OSS", len(uploaded_files))
+                            except Exception as e:
+                                log.warning("Qwen: image upload failed: %s", e)
+
                 except BannedProxyError:
                     if proxy_url and attempt < MAX_PROXY_RETRIES:
                         log.warning("Qwen: proxy banned during chat creation, switching")
@@ -934,10 +911,19 @@ class QwenBackend(BaseBackend):
                     "qwen_proxy": proxy_url,
                 })
 
-            # نمرر uploaded_files إلى الـ payload
-            payload = _qwen_build_payload(qwen_chat_id, prompt, parent_id,
-                                          thinking=thinking,
-                                          files=uploaded_files)
+            # ── رفع الصور إذا كانت جلسة قديمة ولم ترفع بعد
+            if image_items and not uploaded_files:
+                async with _make_qwen_client(proxy_url) as tmp2:
+                    try:
+                        uploaded_files = await _resolve_images(image_items, token, tmp2)
+                    except Exception as e:
+                        log.warning("Qwen: image upload (existing session) failed: %s", e)
+
+            payload = _qwen_build_payload(
+                qwen_chat_id, prompt, parent_id,
+                thinking=thinking,
+                files=uploaded_files if uploaded_files else None,
+            )
 
             async with _make_qwen_client(proxy_url) as client:
                 qwen_text, last_rid, was_banned = await _qwen_stream_collect(
@@ -953,7 +939,7 @@ class QwenBackend(BaseBackend):
             await _update_session(token, conv_id, parent_id=last_rid)
             break
 
-        # 4) معالجة النتيجة
+        # ── ① إصلاح Tool Call: نكشف الأداة أولاً قبل clean_text
         tc = parse_tool_call(qwen_text)
         if tc:
             call_id = f"call_{uuid.uuid4().hex[:24]}"
@@ -961,6 +947,7 @@ class QwenBackend(BaseBackend):
             yield sse_chunk(tc=tc, model=self.model_id, call_id=call_id, finish=True)
             yield "data: [DONE]\n\n"
         else:
+            # لا توجد أداة → نظّف النص العادي
             txt = clean_text(qwen_text) or "[Qwen: empty response]"
             for i in range(0, max(len(txt), 1), 40):
                 yield sse_chunk(txt[i:i+40], model=self.model_id)
@@ -981,21 +968,13 @@ DEEPSEEK_CHAT_URL         = "https://chat.deepseek.com/api/v0/chat/completion"
 DEEPSEEK_SESSION_URL      = "https://chat.deepseek.com/api/v0/chat_session/create"
 RAILWAY_POW_URL           = "https://pow.up.railway.app/pow"
 
-# رسائل خطأ DeepSeek التي تعني "الخادم مشغول"
 DEEPSEEK_SERVER_BUSY_PATTERNS = [
-    "server is busy",
-    "الخادم مشغول",
-    "try again later",
-    "حاول مرة أخرى",
-    "use fast mode",
-    "السريع",
-    "overloaded",
-    "too many requests",
-    "rate limit",
+    "server is busy", "الخادم مشغول", "try again later", "حاول مرة أخرى",
+    "use fast mode", "السريع", "overloaded", "too many requests", "rate limit",
 ]
 
+
 def _ds_is_server_busy(text: str) -> bool:
-    """فحص إذا كان الخطأ يعني الخادم مشغول"""
     lower = text.lower()
     return any(p in lower for p in DEEPSEEK_SERVER_BUSY_PATTERNS)
 
@@ -1083,18 +1062,16 @@ class DeepSeekBackend(BaseBackend):
         model_type     = extra.get("model_type", self._model_type)
         search_enabled = extra.get("search_enabled", True)
 
-        prompt = build_full_prompt(messages, tools)
+        # DeepSeek نصي فقط — نُحوّل الصور لنص
+        messages_clean, _ = _extract_images_from_messages(messages)
+        prompt = build_full_prompt(messages_clean, tools)
         if not prompt.strip():
             return
 
         await _evict_old_sessions()
 
-        # نحاول مرتين كحد أقصى (نفس الوضع + وضع مختلف)
-        # الإستراتيجية:
-        #   محاولة 1: إذا فشلت → محادثة جديدة، نفس الوضع
-        #   محاولة 2: إذا فشلت → محادثة جديدة، وضع مختلف
         MAX_DS_RETRIES = 2
-        current_type = model_type
+        current_type   = model_type
 
         for attempt in range(MAX_DS_RETRIES + 1):
             sess = await _get_session(token, conv_id)
@@ -1105,7 +1082,6 @@ class DeepSeekBackend(BaseBackend):
                     log.info("DeepSeek[%s]: reusing session=%s parent=%s",
                              current_type, session_id, parent_message_id)
                 else:
-                    # إنشاء محادثة جديدة
                     if attempt > 0:
                         log.info("DeepSeek: retry attempt=%d, creating new session, mode=%s",
                                  attempt, current_type)
@@ -1135,9 +1111,9 @@ class DeepSeekBackend(BaseBackend):
                     "stream":            True,
                 }
 
-                headers   = _ds_headers(token, pow_response)
-                full_text = ""
-                thinking_text     = ""
+                headers       = _ds_headers(token, pow_response)
+                full_text     = ""
+                thinking_text = ""
                 new_parent_msg_id = None
                 stream_error      = None
 
@@ -1189,7 +1165,6 @@ class DeepSeekBackend(BaseBackend):
                     stream_error = str(e)
                     log.error("DeepSeek stream error: %s", e)
 
-            # فحص إذا كان الخطأ "الخادم مشغول"
             is_busy = (
                 stream_error and _ds_is_server_busy(stream_error)
             ) or (
@@ -1197,17 +1172,14 @@ class DeepSeekBackend(BaseBackend):
             )
 
             if is_busy and attempt < MAX_DS_RETRIES:
-                # تبديل الوضع في المحاولة الثانية
                 if attempt == 0:
                     log.warning("DeepSeek: server busy, retrying with new session (same mode)")
                 elif attempt == 1:
-                    # تبديل expert ↔ default
                     current_type = "default" if current_type == "expert" else "expert"
                     log.warning("DeepSeek: server busy again, switching mode to %s", current_type)
                 await asyncio.sleep(1)
                 continue
 
-            # نجاح أو لا يوجد داعي للتكرار
             break
 
         if new_parent_msg_id:
@@ -1226,6 +1198,7 @@ class DeepSeekBackend(BaseBackend):
             thinking_payload = json.dumps({"type": "thinking", "content": thinking_text}, ensure_ascii=False)
             yield f"data: {thinking_payload}\n\n"
 
+        # ── ① إصلاح Tool Call
         tc = parse_tool_call(full_text)
         if tc:
             call_id = f"call_{uuid.uuid4().hex[:24]}"
@@ -1256,13 +1229,9 @@ GEMINI_MODEL_JSPB = (
     '[4,5,6,8,4,5,6,8],null,null,1,null,null,1,1,'
     '"036033AF-386B-4A1C-A8B6-F563586CF2B9"]'
 )
-GEMINI_BASE_URL = (
-    f"https://gemini.google.com/{GEMINI_USER_ACCT}/_/BardChatUi/data"
-)
+GEMINI_BASE_URL = f"https://gemini.google.com/{GEMINI_USER_ACCT}/_/BardChatUi/data"
 GEMINI_APP_URL  = f"https://gemini.google.com/{GEMINI_USER_ACCT}/app"
-GEMINI_STREAM_URL = (
-    f"{GEMINI_BASE_URL}/assistant.lamda.BardFrontendService/StreamGenerate"
-)
+GEMINI_STREAM_URL = f"{GEMINI_BASE_URL}/assistant.lamda.BardFrontendService/StreamGenerate"
 
 GEMINI_TRACKED_COOKIES = {
     "SIDCC", "__Secure-1PSIDCC", "__Secure-3PSIDCC",
@@ -1324,19 +1293,19 @@ async def _gemini_update_cookies(cookie_key: str, response_cookies) -> None:
 
 def _gemini_headers(cookies_str: str) -> Dict[str, str]:
     return {
-        "authority":        "gemini.google.com",
-        "accept":           "*/*",
-        "accept-language":  "ar,en-US;q=0.9,en;q=0.8",
-        "origin":           "https://gemini.google.com",
-        "referer":          "https://gemini.google.com/",
-        "user-agent":       (
+        "authority":       "gemini.google.com",
+        "accept":          "*/*",
+        "accept-language": "ar,en-US;q=0.9,en;q=0.8",
+        "origin":          "https://gemini.google.com",
+        "referer":         "https://gemini.google.com/",
+        "user-agent":      (
             "Mozilla/5.0 (Linux; Android 6.0; Nexus 5 Build/MRA58N) "
             "AppleWebKit/537.36 (KHTML, like Gecko) "
             "Chrome/109.0.0.0 Mobile Safari/537.36"
         ),
-        "x-same-domain":    "1",
-        "content-type":     "application/x-www-form-urlencoded;charset=UTF-8",
-        "cookie":           cookies_str,
+        "x-same-domain":   "1",
+        "content-type":    "application/x-www-form-urlencoded;charset=UTF-8",
+        "cookie":          cookies_str,
     }
 
 
@@ -1352,12 +1321,9 @@ async def _gemini_get_tokens(
     try:
         url = GEMINI_APP_URL
         for _ in range(5):
-            resp = await client.get(
-                url, headers=headers, timeout=30, follow_redirects=False,
-            )
+            resp = await client.get(url, headers=headers, timeout=30, follow_redirects=False)
             log.info("Gemini token fetch: status=%d url=%s body_len=%d",
                      resp.status_code, url, len(resp.text))
-
             if resp.status_code in (301, 302, 303, 307, 308):
                 location = resp.headers.get("location", "")
                 if not location:
@@ -1366,7 +1332,6 @@ async def _gemini_get_tokens(
                     location = "https://gemini.google.com" + location
                 url = location
                 await _gemini_update_cookies(cookie_key, resp.cookies)
-                log.info("Gemini: redirect → %s", url[:80])
                 continue
             break
 
@@ -1515,7 +1480,8 @@ class GeminiBackend(BaseBackend):
         return GEMINI_PROXY_ID
 
     async def complete(self, token, messages, tools, thinking, conv_id, extra) -> AsyncIterator[str]:
-        prompt = build_full_prompt(messages, tools)
+        messages_clean, _ = _extract_images_from_messages(messages)
+        prompt = build_full_prompt(messages_clean, tools)
         if not prompt.strip():
             return
 
@@ -1529,16 +1495,12 @@ class GeminiBackend(BaseBackend):
                 snlm0e      = sess["gemini_snlm0e"]
                 fdrfje      = sess["gemini_fdrfje"]
                 gemini_conv = sess.get("gemini_conv")
-                log.info("Gemini: reusing session conv=%s snlm0e=%s",
-                         conv_id, snlm0e[:8] if snlm0e else "?")
             else:
                 cookies = await _gemini_get_cookies(cookie_key, token)
-                log.info("Gemini: fetching tokens, cookies=%d keys", len(cookies))
                 snlm0e, fdrfje = await _gemini_get_tokens(cookies, client, cookie_key)
 
                 if not snlm0e:
                     err_msg = "[Gemini Error: failed to get session tokens — check cookies]"
-                    log.error(err_msg)
                     yield sse_chunk(err_msg, model=self.model_id)
                     yield sse_chunk(model=self.model_id, finish=True)
                     yield "data: [DONE]\n\n"
@@ -1551,18 +1513,16 @@ class GeminiBackend(BaseBackend):
                     "gemini_conv":   gemini_conv,
                     "gemini_ck":     cookie_key,
                 })
-                log.info("Gemini: new session conv=%s snlm0e=%s", conv_id, snlm0e[:8])
 
             cookies = await _gemini_get_cookies(cookie_key, token)
-            log.info("Gemini: sending message, conv_id=%s cookies=%d", conv_id, len(cookies))
             full_text, updated_conv = await _gemini_send_message(
                 cookies, client, cookie_key,
                 prompt, snlm0e, fdrfje, gemini_conv,
             )
 
         await _update_session(token, conv_id, gemini_conv=updated_conv)
-        log.info("Gemini: text=%d chars", len(full_text))
 
+        # ── ① إصلاح Tool Call
         tc = parse_tool_call(full_text)
         if tc:
             call_id = f"call_{uuid.uuid4().hex[:24]}"
@@ -1645,7 +1605,7 @@ def _request_hash(messages: List[Dict], tools: List[Dict]) -> str:
 # FastAPI App
 # ══════════════════════════════════════════════════════════
 
-app = FastAPI(title="Universal AI Proxy", version="9.0.0", docs_url="/docs")
+app = FastAPI(title="Universal AI Proxy", version="10.0.0", docs_url="/docs")
 app.add_middleware(CORSMiddleware, allow_origins=["*"], allow_methods=["*"], allow_headers=["*"])
 
 
@@ -1660,7 +1620,7 @@ def _extract_token(authorization: Optional[str]) -> str:
 async def health():
     pm = proxy_manager
     return {
-        "status": "ok", "proxy": "Universal AI Proxy", "version": "9.0.0",
+        "status": "ok", "proxy": "Universal AI Proxy", "version": "10.0.0",
         "active_sessions": len(_sessions),
         "gemini_cookie_keys": len(_gemini_cookie_store),
         "backends": list(_BACKENDS.keys()),
@@ -1671,29 +1631,89 @@ async def health():
             "available": len(pm._available()),
         },
         "models": {
-            "qwen":             "Qwen3.8-max via chat.qwen.ai (with proxy rotation and image support)",
-            "deepseek":         "DeepSeek Expert (auto-fallback on busy)",
-            "deepseek-default": "DeepSeek Default (auto-fallback on busy)",
-            "gemini":           "Gemini via gemini.google.com (cookies-based)",
+            "qwen":             "Qwen3.8-max (vision + tools + proxy rotation)",
+            "deepseek":         "DeepSeek Expert (text only, auto-fallback)",
+            "deepseek-default": "DeepSeek Default (text only, auto-fallback)",
+            "gemini":           "Gemini (text only, cookies-based)",
         },
-        "new_in_v9": [
-            "DeepSeek: auto-retry on server busy (new session → switch mode)",
-            "Regenerate: clears session for fresh conversation",
-            "Qwen: proxy rotation on ban (403/429 only, not on connection errors)",
-            "Proxy: sticky per session, same-country rotation",
-            "Qwen: image attachment upload (max 5 images)",
+        "new_in_v10": [
+            "① Tool Call fix: extracts tool even when mixed with text",
+            "② Vision/Multimodal: Qwen accepts image_url in messages",
+            "② OSS upload: images auto-uploaded to Qwen OSS before chat",
+            "② /v1/models: vision capability declared for qwen",
         ],
     }
 
 
+# ── ② /v1/models يُعلن قدرات Vision ─────────────────────────────────
 @app.get("/v1/models", tags=["models"])
 async def list_models():
     models = [
-        {"id": mid, "object": "model", "created": 1700000000, "owned_by": "proxy"}
-        for mid in _BACKENDS
+        {
+            "id":         "qwen",
+            "object":     "model",
+            "created":    1700000000,
+            "owned_by":   "qwen",
+            # إعلان قدرة Vision لـ Open Minis وكل OpenAI-compatible clients
+            "capabilities": {
+                "vision":             True,
+                "tool_choice":        True,
+                "parallel_tool_calls": False,
+            },
+            # بعض clients تقرأ هذه الحقول مباشرة
+            "supports_vision":      True,
+            "supports_tools":       True,
+            "multimodal":           True,
+            "context_window":       128000,
+        },
+        {
+            "id": "deepseek", "object": "model", "created": 1700000000, "owned_by": "deepseek",
+            "capabilities": {"vision": False, "tool_choice": True},
+            "context_window": 64000,
+        },
+        {
+            "id": "deepseek-default", "object": "model", "created": 1700000000, "owned_by": "deepseek",
+            "capabilities": {"vision": False, "tool_choice": True},
+            "context_window": 64000,
+        },
+        {
+            "id": "gemini", "object": "model", "created": 1700000000, "owned_by": "google",
+            "capabilities": {"vision": False, "tool_choice": True},
+            "context_window": 32000,
+        },
+        # alias للـ vision (بعض clients تبحث عن -vision في الاسم)
+        {
+            "id":         "qwen-vision",
+            "object":     "model",
+            "created":    1700000000,
+            "owned_by":   "qwen",
+            "capabilities": {"vision": True, "tool_choice": True},
+            "supports_vision": True,
+            "multimodal":      True,
+            "context_window":  128000,
+        },
     ]
-    models.append({"id": "qwen-vision", "object": "model", "created": 1700000000, "owned_by": "qwen"})
     return {"object": "list", "data": models}
+
+
+# ── ② endpoint للقدرات (بعض clients تستعلمه مباشرة) ─────────────────
+@app.get("/v1/models/{model_id}", tags=["models"])
+async def get_model(model_id: str):
+    vision_models = {"qwen", "qwen-vision"}
+    return {
+        "id":         model_id,
+        "object":     "model",
+        "created":    1700000000,
+        "owned_by":   "proxy",
+        "capabilities": {
+            "vision":             model_id in vision_models,
+            "tool_choice":        True,
+            "parallel_tool_calls": False,
+        },
+        "supports_vision": model_id in vision_models,
+        "multimodal":      model_id in vision_models,
+        "context_window":  128000 if model_id in vision_models else 64000,
+    }
 
 
 @app.post("/v1/chat/completions", tags=["chat"])
@@ -1708,6 +1728,10 @@ async def chat_completions(
     do_stream = body.get("stream", False)
     model    = body.get("model", QWEN_PROXY_ID)
 
+    # qwen-vision → qwen (نفس الـ backend)
+    if model == "qwen-vision":
+        model = QWEN_PROXY_ID
+
     thinking = resolve_thinking(body)
     extra    = resolve_extra(body, model)
 
@@ -1719,11 +1743,9 @@ async def chat_completions(
     )
     conv_id = _compute_conv_id(messages, explicit_conv_id)
 
-    # ── Regenerate: حذف الجلسة لإنشاء محادثة جديدة ──────────────────
     if _is_regenerate_request(body):
         log.info("Regenerate detected for conv=%s, clearing session", conv_id[:16])
         await _clear_session(token, conv_id)
-        # إعادة تعيين البروكسي أيضاً (للتنويع)
         if proxy_manager.enabled:
             async with proxy_manager._lock:
                 proxy_manager._session_proxy.pop(conv_id, None)
@@ -1850,5 +1872,5 @@ async def _generic_err(request: Request, exc: Exception):
 if __name__ == "__main__":
     import uvicorn
     port = int(os.environ.get("PORT", 8000))
-    log.info("Starting Universal AI Proxy v9.0 on port %d", port)
+    log.info("Starting Universal AI Proxy v10.0 on port %d", port)
     uvicorn.run(app, host="0.0.0.0", port=port, log_level="info")

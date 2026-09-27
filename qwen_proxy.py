@@ -1,14 +1,13 @@
-"""Universal AI Proxy  v10.1
+"""Universal AI Proxy  v10.2
 =========================
-التحسينات الجديدة عن v10.0:
-  ③ دعم DeepAI كنماذج إضافية (15 نموذج) عبر backend موحّد
-      - مفتاح الوصول: "زيوس" (يُفعّل استخدام مفتاح DeepAI الداخلي)
-      - يدعم البروكسي عبر proxy_manager الموجود
-      - يستخدم نفس session store للجلسات
-      - يظهر في /v1/models و / health
-      - يستقبل tools + system prompt عبر build_full_prompt
+التحسينات الجديدة عن v10.1:
+  ④ إصلاح Agent لـ DeepAI:
+      - build_deepai_prompt: تذكير قوي قبل Assistant: لتنفيذ ACTION
+      - منع تسريب [SYSTEM] في الرد
+      - إبراز أسماء الأدوات المتاحة في التذكير الأخير
 
 التحسينات السابقة:
+  ③ دعم DeepAI كنماذج إضافية (15 نموذج) عبر backend موحّد
   ① إصلاح Tool Call: استخراج الأداة حتى لو كانت مدفونة في نص عادي
   ② دعم الصور (Vision/Multimodal) لـ Qwen
 """
@@ -639,6 +638,62 @@ def build_full_prompt(messages: List[Dict], tools: List[Dict]) -> str:
         parts.append(conv_text)
     parts.append("Assistant:")
     return "\n\n".join(parts)
+
+
+# ══════════════════════════════════════════════════════════
+# ④ بناء prompt خاص بـ DeepAI مع تذكير قوي قبل Assistant:
+# ══════════════════════════════════════════════════════════
+
+def build_deepai_prompt(messages: List[Dict], tools: List[Dict]) -> str:
+    """
+    نفس build_full_prompt لكن يضيف تذكيراً مكثّفاً قبل 'Assistant:'
+    حتى لا تتجاهل نماذج DeepAI صيغة ACTION وتكتب نصاً وصفيّاً.
+    """
+    base = build_full_prompt(messages, tools)
+
+    if not tools:
+        return base
+
+    # ── استخراج أسماء الأدوات المتاحة
+    tool_names: List[str] = []
+    for t in tools:
+        fn = t.get("function") or t
+        n  = fn.get("name")
+        if n:
+            tool_names.append(n)
+
+    reminder = (
+        "\n\n"
+        "══════════════════════════════════════════════\n"
+        "⚠️  FINAL REMINDER — APPLY BEFORE ANSWERING:\n"
+        "══════════════════════════════════════════════\n"
+        "If the user's request requires a tool, your ENTIRE next reply\n"
+        "MUST be ONLY ONE SINGLE LINE — nothing else:\n"
+        "\n"
+        "ACTION: tool_name|{\"param\": \"value\"}\n"
+        "\n"
+        "Available tool names (use EXACTLY one of these): "
+        + ", ".join(tool_names) + "\n"
+        "\n"
+        "❌ DO NOT describe your plan\n"
+        "❌ DO NOT write 'I will use...' or 'Let me...'\n"
+        "❌ DO NOT explain what the tool does\n"
+        "❌ DO NOT echo \"[SYSTEM]\" or \"[/SYSTEM]\" markers\n"
+        "❌ DO NOT return JSON tool_calls format\n"
+        "✅ ONLY the single ACTION line — nothing before it, nothing after it\n"
+        "\n"
+        "If NO tool is needed → reply normally in plain text (no ACTION line).\n"
+        "══════════════════════════════════════════════\n"
+        "Assistant:"
+    )
+
+    # ── استبدال آخر "Assistant:" بالتذكير القوي
+    if base.endswith("Assistant:"):
+        base = base[:-len("Assistant:")].rstrip() + reminder
+    else:
+        base += reminder
+
+    return base
 
 
 def make_tc_response(tc: Dict, model: str) -> Dict:
@@ -1638,7 +1693,7 @@ class DeepAIBackend(BaseBackend):
     - يستخدم مفتاح DEEPAI_API_KEY الداخلي عندما يكون token == DEEPAI_MASTER_KEY ("زيوس")
     - وإلا يستخدم الـ token الممرر كما هو (يسمح بمفاتيح DeepAI مخصصة)
     - يعيد استخدام proxy_manager لتبديل البروكسي عند الحظر
-    - يستخدم build_full_prompt ليصل system prompt + tools + تعليمات agent
+    - يستخدم build_deepai_prompt ليصل system prompt + tools + تذكير قوي
     """
 
     def __init__(self, model_name: str):
@@ -1670,10 +1725,8 @@ class DeepAIBackend(BaseBackend):
                 "deepai_sensitivity_id": sensitivity_id,
             })
 
-        # ── بناء prompt كامل يحتوي system + tools + conversation
-        # نستخدم نفس دالة build_full_prompt التي تستخدمها Qwen/DeepSeek/Gemini
-        # حتى تصل التعليمات والأدوات لنماذج DeepAI
-        full_prompt = build_full_prompt(messages, tools)
+        # ── ④ بناء prompt كامل + تذكير قوي قبل Assistant:
+        full_prompt = build_deepai_prompt(messages, tools)
         if not full_prompt.strip():
             return
         history = [{"role": "user", "content": full_prompt}]
@@ -1755,6 +1808,9 @@ class DeepAIBackend(BaseBackend):
             assistant_reply = f"[DeepAI Error: {stream_error}]"
         if not assistant_reply:
             assistant_reply = "[DeepAI: empty response]"
+
+        # ── ④ تنظيف أي تسريب لوسوم [SYSTEM]
+        assistant_reply = assistant_reply.replace("[SYSTEM]", "").replace("[/SYSTEM]", "")
 
         # ── فحص استدعاء الأداة
         tc = parse_tool_call(assistant_reply)
@@ -1841,7 +1897,7 @@ def _request_hash(messages: List[Dict], tools: List[Dict]) -> str:
 # FastAPI App
 # ══════════════════════════════════════════════════════════
 
-app = FastAPI(title="Universal AI Proxy", version="10.1.0", docs_url="/docs")
+app = FastAPI(title="Universal AI Proxy", version="10.2.0", docs_url="/docs")
 app.add_middleware(CORSMiddleware, allow_origins=["*"], allow_methods=["*"], allow_headers=["*"])
 
 
@@ -1856,7 +1912,7 @@ def _extract_token(authorization: Optional[str]) -> str:
 async def health():
     pm = proxy_manager
     return {
-        "status": "ok", "proxy": "Universal AI Proxy", "version": "10.1.0",
+        "status": "ok", "proxy": "Universal AI Proxy", "version": "10.2.0",
         "active_sessions": len(_sessions),
         "gemini_cookie_keys": len(_gemini_cookie_store),
         "backends": list(_BACKENDS.keys()),
@@ -1875,6 +1931,11 @@ async def health():
         },
         "deepai_models": DEEPAI_WORKING_MODELS,
         "deepai_access_key": DEEPAI_MASTER_KEY,
+        "new_in_v10_2": [
+            "④ DeepAI agent fix: build_deepai_prompt with strong ACTION reminder",
+            "④ Strips leaked [SYSTEM] markers from DeepAI responses",
+            "④ Lists available tool names in final reminder",
+        ],
         "new_in_v10_1": [
             "③ DeepAI support (15 models) with key زيوس",
             "③ Uses shared proxy_manager for rotation",
@@ -2132,5 +2193,5 @@ async def _generic_err(request: Request, exc: Exception):
 if __name__ == "__main__":
     import uvicorn
     port = int(os.environ.get("PORT", 8000))
-    log.info("Starting Universal AI Proxy v10.1 on port %d", port)
+    log.info("Starting Universal AI Proxy v10.2 on port %d", port)
     uvicorn.run(app, host="0.0.0.0", port=port, log_level="info")

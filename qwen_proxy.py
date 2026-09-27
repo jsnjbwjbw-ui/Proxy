@@ -1,15 +1,14 @@
-"""Universal AI Proxy  v10.0
+"""
+Universal AI Proxy  v10.1
 =========================
-التحسينات الجديدة عن v9:
+كل ما في v10.0 محفوظ حرفيًا، وأُضيف فقط:
+  ✦ Conversation Manager   — سجل محادثات لكل token
+  ✦ Conversation Endpoints — إنشاء/عرض/تعديل/حذف/مسح المحادثات
+  ✦ سطر واحد في chat_completions لتسجيل المحادثة تلقائيًا
+
+التحسينات القديمة في v10.0:
   ① إصلاح Tool Call: استخراج الأداة حتى لو كانت مدفونة في نص عادي
-      - parse_tool_call تبحث في كامل النص (re.search بدل re.match)
-      - has_tool_call() مساعدة تكشف وجود أداة في أي مكان
-      - clean_text() لا تُشغَّل إذا وُجدت أداة
   ② دعم الصور (Vision/Multimodal):
-      - رفع الصور لـ Qwen OSS تلقائياً
-      - قبول image_url في messages بصيغة OpenAI
-      - /v1/models يُعلن vision: true لنموذج qwen
-      - capabilities endpoint جديد
 """
 
 from __future__ import annotations
@@ -179,6 +178,130 @@ async def _evict_old_sessions() -> None:
             del _sessions[k]
         if stale:
             log.info("Evicted %d stale sessions", len(stale))
+
+
+# ══════════════════════════════════════════════════════════
+# Conversation Manager (جديد v10.1 — إضافة فقط)
+# ══════════════════════════════════════════════════════════
+# سجل مستقل تمامًا عن Session Store. لا يؤثر على أي شيء موجود.
+# المفتاح = f"{token[:16]}:{conv_id}" — أي أن كل token له محادثاته الخاصة.
+
+_conversations_registry: Dict[str, Dict[str, Any]] = {}
+_conversations_lock = asyncio.Lock()
+CONVERSATION_TTL = 60 * 60 * 24 * 7   # 7 أيام
+
+
+def _conv_registry_key(token: str, conv_id: str) -> str:
+    return f"{token[:16]}:{conv_id}"
+
+
+async def _conv_register(
+    token: str,
+    conv_id: str,
+    *,
+    title: Optional[str] = None,
+    model: Optional[str] = None,
+    metadata: Optional[Dict[str, Any]] = None,
+) -> Dict[str, Any]:
+    """إنشاء/تحديث محادثة في السجل وإرجاع نسخة منها."""
+    async with _conversations_lock:
+        key  = _conv_registry_key(token, conv_id)
+        now  = time.time()
+        prev = _conversations_registry.get(key)
+        if prev:
+            prev["last_used"] = now
+            if title    is not None: prev["title"]    = title
+            if model    is not None: prev["model"]    = model
+            if metadata is not None:
+                prev.setdefault("metadata", {}).update(metadata)
+            return dict(prev)
+
+        entry = {
+            "id":         conv_id,
+            "title":      title or f"محادثة {datetime.now().strftime('%Y-%m-%d %H:%M')}",
+            "model":      model or QWEN_PROXY_ID,
+            "created_at": now,
+            "last_used":  now,
+            "metadata":   metadata or {},
+        }
+        _conversations_registry[key] = entry
+        return dict(entry)
+
+
+async def _conv_list(token: str) -> List[Dict[str, Any]]:
+    async with _conversations_lock:
+        prefix = f"{token[:16]}:"
+        items  = [dict(v) for k, v in _conversations_registry.items() if k.startswith(prefix)]
+        items.sort(key=lambda x: x.get("last_used", 0), reverse=True)
+        return items
+
+
+async def _conv_get(token: str, conv_id: str) -> Optional[Dict[str, Any]]:
+    async with _conversations_lock:
+        entry = _conversations_registry.get(_conv_registry_key(token, conv_id))
+        return dict(entry) if entry else None
+
+
+async def _conv_update(token: str, conv_id: str, **kwargs) -> Optional[Dict[str, Any]]:
+    async with _conversations_lock:
+        key   = _conv_registry_key(token, conv_id)
+        entry = _conversations_registry.get(key)
+        if not entry:
+            return None
+        for k in ("title", "model", "metadata"):
+            if k in kwargs and kwargs[k] is not None:
+                if k == "metadata":
+                    entry.setdefault("metadata", {}).update(kwargs[k])
+                else:
+                    entry[k] = kwargs[k]
+        entry["last_used"] = time.time()
+        return dict(entry)
+
+
+async def _conv_delete(token: str, conv_id: str) -> bool:
+    async with _conversations_lock:
+        key = _conv_registry_key(token, conv_id)
+        if key in _conversations_registry:
+            del _conversations_registry[key]
+            return True
+        return False
+
+
+async def _conv_touch(token: str, conv_id: str, model: Optional[str] = None) -> None:
+    """
+    تسجيل/تحديث محادثة عند استخدامها.
+    هذه الدالة آمنة تمامًا: لا تُرجع شيئًا، ولا تُغيّر أي سلوك، وكل أخطائها مُتجاهلة.
+    """
+    try:
+        async with _conversations_lock:
+            key = _conv_registry_key(token, conv_id)
+            now = time.time()
+            if key in _conversations_registry:
+                _conversations_registry[key]["last_used"] = now
+                if model:
+                    _conversations_registry[key]["model"] = model
+            else:
+                _conversations_registry[key] = {
+                    "id":         conv_id,
+                    "title":      f"محادثة {datetime.now().strftime('%Y-%m-%d %H:%M')}",
+                    "model":      model or QWEN_PROXY_ID,
+                    "created_at": now,
+                    "last_used":  now,
+                    "metadata":   {},
+                }
+    except Exception as e:
+        log.debug("_conv_touch failed (ignored): %s", e)
+
+
+async def _evict_old_conversations() -> None:
+    async with _conversations_lock:
+        now   = time.time()
+        stale = [k for k, v in _conversations_registry.items()
+                 if now - v.get("last_used", 0) > CONVERSATION_TTL]
+        for k in stale:
+            del _conversations_registry[k]
+        if stale:
+            log.info("Evicted %d stale conversations", len(stale))
 
 
 # ══════════════════════════════════════════════════════════
@@ -1605,7 +1728,7 @@ def _request_hash(messages: List[Dict], tools: List[Dict]) -> str:
 # FastAPI App
 # ══════════════════════════════════════════════════════════
 
-app = FastAPI(title="Universal AI Proxy", version="10.0.0", docs_url="/docs")
+app = FastAPI(title="Universal AI Proxy", version="10.1.0", docs_url="/docs")
 app.add_middleware(CORSMiddleware, allow_origins=["*"], allow_methods=["*"], allow_headers=["*"])
 
 
@@ -1620,10 +1743,11 @@ def _extract_token(authorization: Optional[str]) -> str:
 async def health():
     pm = proxy_manager
     return {
-        "status": "ok", "proxy": "Universal AI Proxy", "version": "10.0.0",
+        "status": "ok", "proxy": "Universal AI Proxy", "version": "10.1.0",
         "active_sessions": len(_sessions),
         "gemini_cookie_keys": len(_gemini_cookie_store),
         "backends": list(_BACKENDS.keys()),
+        "conversations_tracked": len(_conversations_registry),
         "proxy_config": {
             "enabled": pm.enabled,
             "total": len(pm._proxies),
@@ -1636,6 +1760,15 @@ async def health():
             "deepseek-default": "DeepSeek Default (text only, auto-fallback)",
             "gemini":           "Gemini (text only, cookies-based)",
         },
+        "new_in_v10_1": [
+            "✦ Conversation Manager (registry لكل token)",
+            "✦ POST   /v1/conversations             — إنشاء محادثة جديدة",
+            "✦ GET    /v1/conversations             — قائمة كل المحادثات",
+            "✦ GET    /v1/conversations/{id}        — عرض محادثة",
+            "✦ PATCH  /v1/conversations/{id}        — تعديل (عنوان/نموذج)",
+            "✦ DELETE /v1/conversations/{id}        — حذف محادثة",
+            "✦ POST   /v1/conversations/{id}/clear  — مسح جلسة المحادثة",
+        ],
         "new_in_v10": [
             "① Tool Call fix: extracts tool even when mixed with text",
             "② Vision/Multimodal: Qwen accepts image_url in messages",
@@ -1716,6 +1849,115 @@ async def get_model(model_id: str):
     }
 
 
+# ══════════════════════════════════════════════════════════
+# Conversation Endpoints (جديد v10.1 — إضافة فقط)
+# ══════════════════════════════════════════════════════════
+# كل ما يلي لا يمس أي endpoint موجود. عند الاستخدام:
+#   1) POST /v1/conversations  → يحصل العميل على conv_id
+#   2) يرسل chat/completions مع body.get("conversation_id")=conv_id
+#   3) للتبديل بين محادثات: فقط يغيّر conversation_id في الطلب التالي
+# ══════════════════════════════════════════════════════════
+
+@app.post("/v1/conversations", tags=["conversations"])
+async def create_conversation(
+    request: Request,
+    authorization: Optional[str] = Header(None),
+):
+    token = _extract_token(authorization)
+    try:
+        body = await request.json()
+    except Exception:
+        body = {}
+    title      = body.get("title")
+    model      = body.get("model") or QWEN_PROXY_ID
+    metadata   = body.get("metadata")
+    explicit_id = body.get("id") or body.get("conversation_id")
+    conv_id    = explicit_id or ("conv_" + uuid.uuid4().hex)
+    entry      = await _conv_register(token, conv_id, title=title, model=model, metadata=metadata)
+    await _evict_old_conversations()
+    return JSONResponse({"object": "conversation", **entry}, status_code=201)
+
+
+@app.get("/v1/conversations", tags=["conversations"])
+async def list_conversations(authorization: Optional[str] = Header(None)):
+    token = _extract_token(authorization)
+    items = await _conv_list(token)
+    return JSONResponse({
+        "object": "list",
+        "data":   [{"object": "conversation", **it} for it in items],
+    })
+
+
+@app.get("/v1/conversations/{conv_id}", tags=["conversations"])
+async def get_conversation(conv_id: str, authorization: Optional[str] = Header(None)):
+    token = _extract_token(authorization)
+    entry = await _conv_get(token, conv_id)
+    if not entry:
+        raise HTTPException(status_code=404, detail=f"Conversation '{conv_id}' not found.")
+    return JSONResponse({"object": "conversation", **entry})
+
+
+@app.patch("/v1/conversations/{conv_id}", tags=["conversations"])
+async def update_conversation(
+    conv_id: str,
+    request: Request,
+    authorization: Optional[str] = Header(None),
+):
+    token = _extract_token(authorization)
+    try:
+        body = await request.json()
+    except Exception:
+        body = {}
+    entry = await _conv_update(
+        token, conv_id,
+        title=body.get("title"),
+        model=body.get("model"),
+        metadata=body.get("metadata"),
+    )
+    if not entry:
+        raise HTTPException(status_code=404, detail=f"Conversation '{conv_id}' not found.")
+    return JSONResponse({"object": "conversation", **entry})
+
+
+@app.delete("/v1/conversations/{conv_id}", tags=["conversations"])
+async def delete_conversation(conv_id: str, authorization: Optional[str] = Header(None)):
+    token   = _extract_token(authorization)
+    deleted = await _conv_delete(token, conv_id)
+    # تنظيف الجلسة المرتبطة أيضاً (آمن حتى لو لم توجد)
+    try:
+        await _clear_session(token, conv_id)
+    except Exception:
+        pass
+    if proxy_manager.enabled:
+        try:
+            async with proxy_manager._lock:
+                proxy_manager._session_proxy.pop(conv_id, None)
+        except Exception:
+            pass
+    if not deleted:
+        raise HTTPException(status_code=404, detail=f"Conversation '{conv_id}' not found.")
+    return JSONResponse({"object": "conversation.deleted", "id": conv_id, "deleted": True})
+
+
+@app.post("/v1/conversations/{conv_id}/clear", tags=["conversations"])
+async def clear_conversation(conv_id: str, authorization: Optional[str] = Header(None)):
+    token = _extract_token(authorization)
+    await _clear_session(token, conv_id)
+    if proxy_manager.enabled:
+        try:
+            async with proxy_manager._lock:
+                proxy_manager._session_proxy.pop(conv_id, None)
+        except Exception:
+            pass
+    entry = await _conv_update(token, conv_id)   # تحديث last_used
+    return JSONResponse({
+        "object":  "conversation.cleared",
+        "id":      conv_id,
+        "cleared": True,
+        "exists":  entry is not None,
+    })
+
+
 @app.post("/v1/chat/completions", tags=["chat"])
 async def chat_completions(
     request:       Request,
@@ -1742,6 +1984,9 @@ async def chat_completions(
         or request.headers.get("x-session-id")
     )
     conv_id = _compute_conv_id(messages, explicit_conv_id)
+
+    # [جديد v10.1] تسجيل/تحديث المحادثة في سجل المحادثات — لا يؤثر على أي سلوك موجود
+    await _conv_touch(token, conv_id, model)
 
     if _is_regenerate_request(body):
         log.info("Regenerate detected for conv=%s, clearing session", conv_id[:16])
@@ -1872,5 +2117,5 @@ async def _generic_err(request: Request, exc: Exception):
 if __name__ == "__main__":
     import uvicorn
     port = int(os.environ.get("PORT", 8000))
-    log.info("Starting Universal AI Proxy v10.0 on port %d", port)
+    log.info("Starting Universal AI Proxy v10.1 on port %d", port)
     uvicorn.run(app, host="0.0.0.0", port=port, log_level="info")

@@ -1883,10 +1883,10 @@ async def health():
     }
 
 
-# ── ② /v1/models يُعلن قدرات Vision + نماذج DeepAI ──────────────────
+# ── /v1/models يُعلن قدرات Vision + نماذج DeepAI ──────────────────
 @app.get("/v1/models", tags=["models"])
 async def list_models():
-    models = [
+    models: List[Dict[str, Any]] = [
         {
             "id":         "qwen",
             "object":     "model",
@@ -1914,4 +1914,216 @@ async def list_models():
         },
         {
             "id": "gemini", "object": "model", "created": 1700000000, "owned_by": "google",
-            "capabilities":
+            "capabilities": {"vision": False, "tool_choice": True},
+            "context_window": 32000,
+        },
+        # alias للـ vision (بعض clients تبحث عن -vision في الاسم)
+        {
+            "id":         "qwen-vision",
+            "object":     "model",
+            "created":    1700000000,
+            "owned_by":   "qwen",
+            "capabilities": {"vision": True, "tool_choice": True},
+            "supports_vision": True,
+            "multimodal":      True,
+            "context_window":  128000,
+        },
+    ]
+
+    # ── إضافة نماذج DeepAI تلقائياً ──
+    for _m in DEEPAI_WORKING_MODELS:
+        models.append({
+            "id":         _m,
+            "object":     "model",
+            "created":    1700000000,
+            "owned_by":   "deepai",
+            "capabilities": {
+                "vision":             False,
+                "tool_choice":        True,
+                "parallel_tool_calls": False,
+            },
+            "context_window": 32000,
+        })
+
+    return {"object": "list", "data": models}
+
+
+# ── endpoint للقدرات (بعض clients تستعلمه مباشرة) ─────────────────
+@app.get("/v1/models/{model_id}", tags=["models"])
+async def get_model(model_id: str):
+    vision_models = {"qwen", "qwen-vision"}
+    is_deepai     = model_id in DEEPAI_WORKING_MODELS
+    return {
+        "id":         model_id,
+        "object":     "model",
+        "created":    1700000000,
+        "owned_by":   "deepai" if is_deepai else "proxy",
+        "capabilities": {
+            "vision":             model_id in vision_models,
+            "tool_choice":        True,
+            "parallel_tool_calls": False,
+        },
+        "supports_vision": model_id in vision_models,
+        "multimodal":      model_id in vision_models,
+        "context_window":  128000 if model_id in vision_models else (32000 if is_deepai else 64000),
+    }
+
+
+@app.post("/v1/chat/completions", tags=["chat"])
+async def chat_completions(
+    request:       Request,
+    authorization: Optional[str] = Header(None),
+):
+    token    = _extract_token(authorization)
+    body     = await request.json()
+    messages = body.get("messages", [])
+    tools    = body.get("tools", [])
+    do_stream = body.get("stream", False)
+    model    = body.get("model", QWEN_PROXY_ID)
+
+    # qwen-vision → qwen (نفس الـ backend)
+    if model == "qwen-vision":
+        model = QWEN_PROXY_ID
+
+    thinking = resolve_thinking(body)
+    extra    = resolve_extra(body, model)
+
+    explicit_conv_id = (
+        body.get("conversation_id")
+        or body.get("session_id")
+        or request.headers.get("x-conversation-id")
+        or request.headers.get("x-session-id")
+    )
+    conv_id = _compute_conv_id(messages, explicit_conv_id)
+
+    if _is_regenerate_request(body):
+        log.info("Regenerate detected for conv=%s, clearing session", conv_id[:16])
+        await _clear_session(token, conv_id)
+        if proxy_manager.enabled:
+            async with proxy_manager._lock:
+                proxy_manager._session_proxy.pop(conv_id, None)
+
+    log.info("conv=%s model=%s msgs=%d thinking=%s extra=%s",
+             conv_id, model, len(messages), thinking, extra)
+
+    req_hash = _request_hash(messages, tools)
+    if await _is_duplicate(req_hash):
+        log.warning("Duplicate request (conv=%s) — skipping", conv_id)
+        raise HTTPException(status_code=429, detail="Duplicate request — please retry in a moment.")
+
+    backend = get_backend(model)
+    if backend is None:
+        backend = get_backend(QWEN_PROXY_ID)
+        if backend is None:
+            raise HTTPException(status_code=400, detail=f"No backend for model '{model}'.")
+
+    if do_stream:
+        async def event_stream():
+            async for chunk in backend.complete(token, messages, tools, thinking, conv_id, extra):
+                yield chunk
+        return StreamingResponse(event_stream(), media_type="text/event-stream")
+
+    # Non-streaming
+    full_content   = ""
+    finish_reason  = "stop"
+    tool_call_data = None
+
+    async for chunk in backend.complete(token, messages, tools, thinking, conv_id, extra):
+        if chunk.startswith("data: [DONE]"):
+            break
+        if not chunk.startswith("data: "):
+            continue
+        try:
+            obj = json.loads(chunk[6:])
+            if obj.get("type") == "thinking":
+                continue
+            choice = obj["choices"][0]
+            delta  = choice.get("delta", {})
+            fr     = choice.get("finish_reason")
+            if fr:
+                finish_reason = fr
+            if delta.get("tool_calls"):
+                tool_call_data = delta["tool_calls"][0]
+            elif delta.get("content"):
+                full_content += delta["content"]
+        except Exception:
+            continue
+
+    if tool_call_data:
+        return JSONResponse(make_tc_response({
+            "name": tool_call_data["function"]["name"],
+            "arguments": tool_call_data["function"]["arguments"],
+        }, model))
+    return JSONResponse(make_text_response(full_content, model))
+
+
+# ══════════════════════════════════════════════════════════
+# Image Generation (Qwen)
+# ══════════════════════════════════════════════════════════
+
+@app.post("/v1/images/generations", tags=["images"])
+async def image_generations(request: Request, authorization: Optional[str] = Header(None)):
+    token  = _extract_token(authorization)
+    body   = await request.json()
+    prompt = body.get("prompt", "")
+    size   = body.get("size", "1:1").replace("x", ":")
+    if not prompt:
+        raise HTTPException(status_code=400, detail="'prompt' is required.")
+
+    proxy_url = await proxy_manager.get_for_session("img_gen") if proxy_manager.enabled else None
+
+    async with _make_qwen_client(proxy_url) as client:
+        cid     = await _qwen_create_chat(token, client)
+        payload = _qwen_build_payload(cid, prompt, None, chat_type="t2i", size=size)
+        image_url: Optional[str] = None
+        async with client.stream("POST", f"{QWEN_BASE}/chat/completions", json=payload,
+                                  headers=_qwen_headers_chat(token, stream=True),
+                                  params={"chat_id": cid}, timeout=300) as resp:
+            async for raw_line in resp.aiter_lines():
+                if not raw_line or not raw_line.startswith("data: "):
+                    continue
+                ds = raw_line[6:].strip()
+                if ds == "[DONE]":
+                    break
+                if _qwen_is_antibot(raw_line) or _qwen_is_rate_limited(raw_line):
+                    raise HTTPException(status_code=429, detail="Qwen blocked or rate-limited.")
+                try:
+                    obj     = json.loads(ds)
+                    content = obj["choices"][0].get("delta", {}).get("content", "")
+                    if content.startswith("http"):
+                        image_url = content
+                except Exception:
+                    continue
+    if not image_url:
+        raise HTTPException(status_code=500, detail="No image URL returned.")
+    return JSONResponse({"created": int(time.time()), "data": [{"url": image_url}]})
+
+
+# ══════════════════════════════════════════════════════════
+# Error Handlers
+# ══════════════════════════════════════════════════════════
+
+@app.exception_handler(HTTPException)
+async def _http_err(request: Request, exc: HTTPException):
+    return JSONResponse(status_code=exc.status_code,
+                         content={"error": {"message": exc.detail, "type": "proxy_error",
+                                            "code": exc.status_code}})
+
+
+@app.exception_handler(Exception)
+async def _generic_err(request: Request, exc: Exception):
+    log.error("Unhandled: %s", exc, exc_info=True)
+    return JSONResponse(status_code=500,
+                         content={"error": {"message": str(exc), "type": "internal_error",
+                                            "code": 500}})
+
+
+# ══════════════════════════════════════════════════════════
+# Entry Point
+# ══════════════════════════════════════════════════════════
+
+if __name__ == "__main__":
+    import uvicorn
+    port = int(os.environ.get("PORT", 8000))
+    log.info("Starting Universal AI Proxy v10.1 on port %d", port)
+    uvicorn.run(app, host="0.0.0.0", port=port, log_level="info")

@@ -6,6 +6,7 @@
       - يدعم البروكسي عبر proxy_manager الموجود
       - يستخدم نفس session store للجلسات
       - يظهر في /v1/models و / health
+      - يستقبل tools + system prompt عبر build_full_prompt
 
 التحسينات السابقة:
   ① إصلاح Tool Call: استخراج الأداة حتى لو كانت مدفونة في نص عادي
@@ -1637,6 +1638,7 @@ class DeepAIBackend(BaseBackend):
     - يستخدم مفتاح DEEPAI_API_KEY الداخلي عندما يكون token == DEEPAI_MASTER_KEY ("زيوس")
     - وإلا يستخدم الـ token الممرر كما هو (يسمح بمفاتيح DeepAI مخصصة)
     - يعيد استخدام proxy_manager لتبديل البروكسي عند الحظر
+    - يستخدم build_full_prompt ليصل system prompt + tools + تعليمات agent
     """
 
     def __init__(self, model_name: str):
@@ -1668,9 +1670,13 @@ class DeepAIBackend(BaseBackend):
                 "deepai_sensitivity_id": sensitivity_id,
             })
 
-        history = _deepai_messages_to_history(messages)
-        if not history:
+        # ── بناء prompt كامل يحتوي system + tools + conversation
+        # نستخدم نفس دالة build_full_prompt التي تستخدمها Qwen/DeepSeek/Gemini
+        # حتى تصل التعليمات والأدوات لنماذج DeepAI
+        full_prompt = build_full_prompt(messages, tools)
+        if not full_prompt.strip():
             return
+        history = [{"role": "user", "content": full_prompt}]
 
         headers = {**DEEPAI_HEADERS_TEMPLATE, "api-key": api_key}
 
@@ -1873,6 +1879,7 @@ async def health():
             "③ DeepAI support (15 models) with key زيوس",
             "③ Uses shared proxy_manager for rotation",
             "③ Exposes models in /v1/models and /",
+            "③ Sends tools + system prompt via build_full_prompt",
         ],
         "new_in_v10": [
             "① Tool Call fix: extracts tool even when mixed with text",

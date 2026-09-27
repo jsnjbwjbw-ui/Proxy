@@ -1,14 +1,15 @@
-"""
-Universal AI Proxy  v10.1
+"""Universal AI Proxy  v10.1
 =========================
-كل ما في v10.0 محفوظ حرفيًا، وأُضيف فقط:
-  ✦ Conversation Manager   — سجل محادثات لكل token
-  ✦ Conversation Endpoints — إنشاء/عرض/تعديل/حذف/مسح المحادثات
-  ✦ سطر واحد في chat_completions لتسجيل المحادثة تلقائيًا
+التحسينات الجديدة عن v10.0:
+  ③ دعم DeepAI كنماذج إضافية (15 نموذج) عبر backend موحّد
+      - مفتاح الوصول: "زيوس" (يُفعّل استخدام مفتاح DeepAI الداخلي)
+      - يدعم البروكسي عبر proxy_manager الموجود
+      - يستخدم نفس session store للجلسات
+      - يظهر في /v1/models و / health
 
-التحسينات القديمة في v10.0:
+التحسينات السابقة:
   ① إصلاح Tool Call: استخراج الأداة حتى لو كانت مدفونة في نص عادي
-  ② دعم الصور (Vision/Multimodal):
+  ② دعم الصور (Vision/Multimodal) لـ Qwen
 """
 
 from __future__ import annotations
@@ -178,130 +179,6 @@ async def _evict_old_sessions() -> None:
             del _sessions[k]
         if stale:
             log.info("Evicted %d stale sessions", len(stale))
-
-
-# ══════════════════════════════════════════════════════════
-# Conversation Manager (جديد v10.1 — إضافة فقط)
-# ══════════════════════════════════════════════════════════
-# سجل مستقل تمامًا عن Session Store. لا يؤثر على أي شيء موجود.
-# المفتاح = f"{token[:16]}:{conv_id}" — أي أن كل token له محادثاته الخاصة.
-
-_conversations_registry: Dict[str, Dict[str, Any]] = {}
-_conversations_lock = asyncio.Lock()
-CONVERSATION_TTL = 60 * 60 * 24 * 7   # 7 أيام
-
-
-def _conv_registry_key(token: str, conv_id: str) -> str:
-    return f"{token[:16]}:{conv_id}"
-
-
-async def _conv_register(
-    token: str,
-    conv_id: str,
-    *,
-    title: Optional[str] = None,
-    model: Optional[str] = None,
-    metadata: Optional[Dict[str, Any]] = None,
-) -> Dict[str, Any]:
-    """إنشاء/تحديث محادثة في السجل وإرجاع نسخة منها."""
-    async with _conversations_lock:
-        key  = _conv_registry_key(token, conv_id)
-        now  = time.time()
-        prev = _conversations_registry.get(key)
-        if prev:
-            prev["last_used"] = now
-            if title    is not None: prev["title"]    = title
-            if model    is not None: prev["model"]    = model
-            if metadata is not None:
-                prev.setdefault("metadata", {}).update(metadata)
-            return dict(prev)
-
-        entry = {
-            "id":         conv_id,
-            "title":      title or f"محادثة {datetime.now().strftime('%Y-%m-%d %H:%M')}",
-            "model":      model or QWEN_PROXY_ID,
-            "created_at": now,
-            "last_used":  now,
-            "metadata":   metadata or {},
-        }
-        _conversations_registry[key] = entry
-        return dict(entry)
-
-
-async def _conv_list(token: str) -> List[Dict[str, Any]]:
-    async with _conversations_lock:
-        prefix = f"{token[:16]}:"
-        items  = [dict(v) for k, v in _conversations_registry.items() if k.startswith(prefix)]
-        items.sort(key=lambda x: x.get("last_used", 0), reverse=True)
-        return items
-
-
-async def _conv_get(token: str, conv_id: str) -> Optional[Dict[str, Any]]:
-    async with _conversations_lock:
-        entry = _conversations_registry.get(_conv_registry_key(token, conv_id))
-        return dict(entry) if entry else None
-
-
-async def _conv_update(token: str, conv_id: str, **kwargs) -> Optional[Dict[str, Any]]:
-    async with _conversations_lock:
-        key   = _conv_registry_key(token, conv_id)
-        entry = _conversations_registry.get(key)
-        if not entry:
-            return None
-        for k in ("title", "model", "metadata"):
-            if k in kwargs and kwargs[k] is not None:
-                if k == "metadata":
-                    entry.setdefault("metadata", {}).update(kwargs[k])
-                else:
-                    entry[k] = kwargs[k]
-        entry["last_used"] = time.time()
-        return dict(entry)
-
-
-async def _conv_delete(token: str, conv_id: str) -> bool:
-    async with _conversations_lock:
-        key = _conv_registry_key(token, conv_id)
-        if key in _conversations_registry:
-            del _conversations_registry[key]
-            return True
-        return False
-
-
-async def _conv_touch(token: str, conv_id: str, model: Optional[str] = None) -> None:
-    """
-    تسجيل/تحديث محادثة عند استخدامها.
-    هذه الدالة آمنة تمامًا: لا تُرجع شيئًا، ولا تُغيّر أي سلوك، وكل أخطائها مُتجاهلة.
-    """
-    try:
-        async with _conversations_lock:
-            key = _conv_registry_key(token, conv_id)
-            now = time.time()
-            if key in _conversations_registry:
-                _conversations_registry[key]["last_used"] = now
-                if model:
-                    _conversations_registry[key]["model"] = model
-            else:
-                _conversations_registry[key] = {
-                    "id":         conv_id,
-                    "title":      f"محادثة {datetime.now().strftime('%Y-%m-%d %H:%M')}",
-                    "model":      model or QWEN_PROXY_ID,
-                    "created_at": now,
-                    "last_used":  now,
-                    "metadata":   {},
-                }
-    except Exception as e:
-        log.debug("_conv_touch failed (ignored): %s", e)
-
-
-async def _evict_old_conversations() -> None:
-    async with _conversations_lock:
-        now   = time.time()
-        stale = [k for k, v in _conversations_registry.items()
-                 if now - v.get("last_used", 0) > CONVERSATION_TTL]
-        for k in stale:
-            del _conversations_registry[k]
-        if stale:
-            log.info("Evicted %d stale conversations", len(stale))
 
 
 # ══════════════════════════════════════════════════════════
@@ -1664,6 +1541,236 @@ register_backend(GeminiBackend())
 
 
 # ══════════════════════════════════════════════════════════
+# BACKEND 5+: DeepAI (متعدد النماذج) — إضافة جديدة
+# ══════════════════════════════════════════════════════════
+
+DEEPAI_MASTER_KEY = "زيوس"
+DEEPAI_API_KEY    = "tryit-67660760637-46a82fd685adad8b75f28cb8ddbad1fc"
+DEEPAI_URL        = "https://api.deepai.org/hacking_is_a_serious_crime"
+
+DEEPAI_WORKING_MODELS: List[str] = [
+    "standard",
+    "glm-5.3-flash",
+    "qwen-3.8-flash",
+    "gemini-3.1-pro",
+    "deepseek-v4-flash",
+    "deepseek-v3.2",
+    "gpt-6-luna",
+    "gpt-5.6-luna",
+    "tencent-hy3",
+    "gpt-oss-120b",
+    "gemma-4",
+    "llama-3.3-70b-instruct",
+    "llama-3.1-8b-instant",
+    "gpt-4o-mini",
+    "gemini-2.5-flash-lite",
+]
+
+DEEPAI_HEADERS_TEMPLATE: Dict[str, str] = {
+    "host": "api.deepai.org",
+    "sec-ch-ua": '"Chromium";v="137", "Not/A)Brand";v="24"',
+    "sec-ch-ua-mobile": "?1",
+    "user-agent": (
+        "Mozilla/5.0 (Linux; Android 10; K) AppleWebKit/537.36 "
+        "(KHTML, like Gecko) Chrome/137.0.0.0 Mobile Safari/537.36"
+    ),
+    "sec-ch-ua-platform": '"Android"',
+    "accept": "text/event-stream",
+    "origin": "https://deepai.org",
+    "referer": "https://deepai.org/",
+    "sec-fetch-site": "same-site",
+    "sec-fetch-mode": "cors",
+    "sec-fetch-dest": "empty",
+    "accept-language": "ar-EG,ar;q=0.9,en-US;q=0.8,en;q=0.7",
+}
+
+DEEPAI_BAN_CODES = {403, 429, 451}
+
+
+def _deepai_extract_text(obj: Any) -> str:
+    """استخراج النص من استجابة JSON الخاصة بـ DeepAI."""
+    if not isinstance(obj, dict):
+        return ""
+    try:
+        t = (
+            obj.get("choices", [{}])[0].get("delta", {}).get("content")
+            or obj.get("delta")
+            or obj.get("content")
+            or obj.get("text")
+            or obj.get("output")
+        )
+        return t if isinstance(t, str) else ""
+    except Exception:
+        return ""
+
+
+def _deepai_messages_to_history(messages: List[Dict]) -> List[Dict]:
+    """يحوّل رسائل OpenAI إلى chatHistory بصيغة DeepAI."""
+    history: List[Dict] = []
+    for m in messages:
+        role = m.get("role", "user")
+        if role not in ("user", "assistant", "system"):
+            continue
+        content = m.get("content", "")
+        if isinstance(content, list):
+            parts = []
+            for c in content:
+                if isinstance(c, dict) and c.get("type") == "text":
+                    parts.append(c.get("text", ""))
+            content = " ".join(parts)
+        history.append({"role": role, "content": str(content)})
+    return history
+
+
+def _make_deepai_client(proxy_url: Optional[str] = None) -> httpx.AsyncClient:
+    if proxy_url:
+        return httpx.AsyncClient(
+            proxies={"http://": proxy_url, "https://": proxy_url},
+            timeout=REQUEST_TIMEOUT,
+        )
+    return httpx.AsyncClient(timeout=REQUEST_TIMEOUT)
+
+
+class DeepAIBackend(BaseBackend):
+    """
+    Backend موحّد لكل نماذج DeepAI.
+    - يستخدم مفتاح DEEPAI_API_KEY الداخلي عندما يكون token == DEEPAI_MASTER_KEY ("زيوس")
+    - وإلا يستخدم الـ token الممرر كما هو (يسمح بمفاتيح DeepAI مخصصة)
+    - يعيد استخدام proxy_manager لتبديل البروكسي عند الحظر
+    """
+
+    def __init__(self, model_name: str):
+        self._model_name = model_name
+
+    @property
+    def model_id(self) -> str:
+        return self._model_name
+
+    async def complete(self, token, messages, tools, thinking, conv_id, extra) -> AsyncIterator[str]:
+        await _evict_old_sessions()
+
+        # ── اختيار مفتاح API الفعلي
+        if not token or token == DEEPAI_MASTER_KEY:
+            api_key = DEEPAI_API_KEY
+        else:
+            api_key = token
+
+        # ── جلب/إنشاء جلسة خاصة بهذه المحادثة
+        sess = await _get_session(token, conv_id)
+        if sess and sess.get("deepai_uuid"):
+            session_uuid   = sess["deepai_uuid"]
+            sensitivity_id = sess["deepai_sensitivity_id"]
+        else:
+            session_uuid   = str(uuid.uuid4())
+            sensitivity_id = str(uuid.uuid4())
+            await _set_session(token, conv_id, {
+                "deepai_uuid":           session_uuid,
+                "deepai_sensitivity_id": sensitivity_id,
+            })
+
+        history = _deepai_messages_to_history(messages)
+        if not history:
+            return
+
+        headers = {**DEEPAI_HEADERS_TEMPLATE, "api-key": api_key}
+
+        files = {
+            "chat_style":                  (None, "chat"),
+            "language":                    (None, "en"),
+            "chatHistory":                 (None, json.dumps(history, ensure_ascii=False)),
+            "model":                       (None, self._model_name),
+            "session_uuid":                (None, session_uuid),
+            "sensitivity_request_id":      (None, sensitivity_id),
+            "tool_activity_support":       (None, "1"),
+            "thinking_image_tool_support": (None, "1"),
+            "hacker_is_stinky":            (None, "very_stinky"),
+            "enabled_tools":               (None, '["image_generator","image_editor"]'),
+        }
+
+        MAX_DEEPAI_RETRIES = 2
+        assistant_reply    = ""
+        stream_error: Optional[str] = None
+
+        for attempt in range(MAX_DEEPAI_RETRIES + 1):
+            proxy_url = await proxy_manager.get_for_session(conv_id) if proxy_manager.enabled else None
+            try:
+                async with _make_deepai_client(proxy_url) as client:
+                    async with client.stream("POST", DEEPAI_URL, headers=headers, files=files) as resp:
+                        if resp.status_code in DEEPAI_BAN_CODES and proxy_url and attempt < MAX_DEEPAI_RETRIES:
+                            log.warning("DeepAI: HTTP %d → switching proxy", resp.status_code)
+                            await proxy_manager.mark_banned(proxy_url, conv_id)
+                            await _clear_session(token, conv_id)
+                            assistant_reply = ""
+                            continue
+
+                        ctype  = resp.headers.get("content-type", "")
+                        is_sse = "text/event-stream" in ctype
+
+                        buffer = ""
+                        async for chunk in resp.aiter_text():
+                            if not chunk:
+                                continue
+                            if is_sse:
+                                buffer += chunk
+                                while "\n" in buffer:
+                                    line, buffer = buffer.split("\n", 1)
+                                    line = line.strip()
+                                    if not line or not line.startswith("data:"):
+                                        continue
+                                    payload = line[5:].strip()
+                                    if payload == "[DONE]":
+                                        continue
+                                    try:
+                                        obj  = json.loads(payload)
+                                        text = _deepai_extract_text(obj)
+                                        if text:
+                                            assistant_reply += text
+                                    except json.JSONDecodeError:
+                                        assistant_reply += payload
+                            else:
+                                assistant_reply += chunk
+                break
+
+            except (httpx.ProxyError, httpx.ConnectError, httpx.ConnectTimeout) as e:
+                stream_error = str(e)
+                if proxy_url and attempt < MAX_DEEPAI_RETRIES:
+                    log.warning("DeepAI: proxy error (%s) → switching", e)
+                    await proxy_manager.mark_banned(proxy_url, conv_id)
+                    continue
+                log.error("DeepAI: all proxy attempts failed: %s", e)
+                break
+            except Exception as e:
+                stream_error = str(e)
+                log.error("DeepAI stream error: %s", e, exc_info=True)
+                break
+
+        # ── إخراج SSE
+        if stream_error and not assistant_reply:
+            assistant_reply = f"[DeepAI Error: {stream_error}]"
+        if not assistant_reply:
+            assistant_reply = "[DeepAI: empty response]"
+
+        # ── فحص استدعاء الأداة
+        tc = parse_tool_call(assistant_reply)
+        if tc:
+            call_id = f"call_{uuid.uuid4().hex[:24]}"
+            yield sse_chunk(tc=tc, model=self.model_id, call_id=call_id)
+            yield sse_chunk(tc=tc, model=self.model_id, call_id=call_id, finish=True)
+            yield "data: [DONE]\n\n"
+        else:
+            txt = clean_text(assistant_reply) or "[DeepAI: empty response]"
+            for i in range(0, max(len(txt), 1), 40):
+                yield sse_chunk(txt[i:i+40], model=self.model_id)
+            yield sse_chunk(model=self.model_id, finish=True)
+            yield "data: [DONE]\n\n"
+
+
+# تسجيل كل نماذج DeepAI في السجل
+for _deepai_model in DEEPAI_WORKING_MODELS:
+    register_backend(DeepAIBackend(_deepai_model))
+
+
+# ══════════════════════════════════════════════════════════
 # Helpers
 # ══════════════════════════════════════════════════════════
 
@@ -1747,7 +1854,6 @@ async def health():
         "active_sessions": len(_sessions),
         "gemini_cookie_keys": len(_gemini_cookie_store),
         "backends": list(_BACKENDS.keys()),
-        "conversations_tracked": len(_conversations_registry),
         "proxy_config": {
             "enabled": pm.enabled,
             "total": len(pm._proxies),
@@ -1759,15 +1865,14 @@ async def health():
             "deepseek":         "DeepSeek Expert (text only, auto-fallback)",
             "deepseek-default": "DeepSeek Default (text only, auto-fallback)",
             "gemini":           "Gemini (text only, cookies-based)",
+            "deepai":           "DeepAI multi-model (15 models, key: زيوس)",
         },
+        "deepai_models": DEEPAI_WORKING_MODELS,
+        "deepai_access_key": DEEPAI_MASTER_KEY,
         "new_in_v10_1": [
-            "✦ Conversation Manager (registry لكل token)",
-            "✦ POST   /v1/conversations             — إنشاء محادثة جديدة",
-            "✦ GET    /v1/conversations             — قائمة كل المحادثات",
-            "✦ GET    /v1/conversations/{id}        — عرض محادثة",
-            "✦ PATCH  /v1/conversations/{id}        — تعديل (عنوان/نموذج)",
-            "✦ DELETE /v1/conversations/{id}        — حذف محادثة",
-            "✦ POST   /v1/conversations/{id}/clear  — مسح جلسة المحادثة",
+            "③ DeepAI support (15 models) with key زيوس",
+            "③ Uses shared proxy_manager for rotation",
+            "③ Exposes models in /v1/models and /",
         ],
         "new_in_v10": [
             "① Tool Call fix: extracts tool even when mixed with text",
@@ -1778,7 +1883,7 @@ async def health():
     }
 
 
-# ── ② /v1/models يُعلن قدرات Vision ─────────────────────────────────
+# ── ② /v1/models يُعلن قدرات Vision + نماذج DeepAI ──────────────────
 @app.get("/v1/models", tags=["models"])
 async def list_models():
     models = [
@@ -1787,13 +1892,11 @@ async def list_models():
             "object":     "model",
             "created":    1700000000,
             "owned_by":   "qwen",
-            # إعلان قدرة Vision لـ Open Minis وكل OpenAI-compatible clients
             "capabilities": {
                 "vision":             True,
                 "tool_choice":        True,
                 "parallel_tool_calls": False,
             },
-            # بعض clients تقرأ هذه الحقول مباشرة
             "supports_vision":      True,
             "supports_tools":       True,
             "multimodal":           True,
@@ -1811,311 +1914,4 @@ async def list_models():
         },
         {
             "id": "gemini", "object": "model", "created": 1700000000, "owned_by": "google",
-            "capabilities": {"vision": False, "tool_choice": True},
-            "context_window": 32000,
-        },
-        # alias للـ vision (بعض clients تبحث عن -vision في الاسم)
-        {
-            "id":         "qwen-vision",
-            "object":     "model",
-            "created":    1700000000,
-            "owned_by":   "qwen",
-            "capabilities": {"vision": True, "tool_choice": True},
-            "supports_vision": True,
-            "multimodal":      True,
-            "context_window":  128000,
-        },
-    ]
-    return {"object": "list", "data": models}
-
-
-# ── ② endpoint للقدرات (بعض clients تستعلمه مباشرة) ─────────────────
-@app.get("/v1/models/{model_id}", tags=["models"])
-async def get_model(model_id: str):
-    vision_models = {"qwen", "qwen-vision"}
-    return {
-        "id":         model_id,
-        "object":     "model",
-        "created":    1700000000,
-        "owned_by":   "proxy",
-        "capabilities": {
-            "vision":             model_id in vision_models,
-            "tool_choice":        True,
-            "parallel_tool_calls": False,
-        },
-        "supports_vision": model_id in vision_models,
-        "multimodal":      model_id in vision_models,
-        "context_window":  128000 if model_id in vision_models else 64000,
-    }
-
-
-# ══════════════════════════════════════════════════════════
-# Conversation Endpoints (جديد v10.1 — إضافة فقط)
-# ══════════════════════════════════════════════════════════
-# كل ما يلي لا يمس أي endpoint موجود. عند الاستخدام:
-#   1) POST /v1/conversations  → يحصل العميل على conv_id
-#   2) يرسل chat/completions مع body.get("conversation_id")=conv_id
-#   3) للتبديل بين محادثات: فقط يغيّر conversation_id في الطلب التالي
-# ══════════════════════════════════════════════════════════
-
-@app.post("/v1/conversations", tags=["conversations"])
-async def create_conversation(
-    request: Request,
-    authorization: Optional[str] = Header(None),
-):
-    token = _extract_token(authorization)
-    try:
-        body = await request.json()
-    except Exception:
-        body = {}
-    title      = body.get("title")
-    model      = body.get("model") or QWEN_PROXY_ID
-    metadata   = body.get("metadata")
-    explicit_id = body.get("id") or body.get("conversation_id")
-    conv_id    = explicit_id or ("conv_" + uuid.uuid4().hex)
-    entry      = await _conv_register(token, conv_id, title=title, model=model, metadata=metadata)
-    await _evict_old_conversations()
-    return JSONResponse({"object": "conversation", **entry}, status_code=201)
-
-
-@app.get("/v1/conversations", tags=["conversations"])
-async def list_conversations(authorization: Optional[str] = Header(None)):
-    token = _extract_token(authorization)
-    items = await _conv_list(token)
-    return JSONResponse({
-        "object": "list",
-        "data":   [{"object": "conversation", **it} for it in items],
-    })
-
-
-@app.get("/v1/conversations/{conv_id}", tags=["conversations"])
-async def get_conversation(conv_id: str, authorization: Optional[str] = Header(None)):
-    token = _extract_token(authorization)
-    entry = await _conv_get(token, conv_id)
-    if not entry:
-        raise HTTPException(status_code=404, detail=f"Conversation '{conv_id}' not found.")
-    return JSONResponse({"object": "conversation", **entry})
-
-
-@app.patch("/v1/conversations/{conv_id}", tags=["conversations"])
-async def update_conversation(
-    conv_id: str,
-    request: Request,
-    authorization: Optional[str] = Header(None),
-):
-    token = _extract_token(authorization)
-    try:
-        body = await request.json()
-    except Exception:
-        body = {}
-    entry = await _conv_update(
-        token, conv_id,
-        title=body.get("title"),
-        model=body.get("model"),
-        metadata=body.get("metadata"),
-    )
-    if not entry:
-        raise HTTPException(status_code=404, detail=f"Conversation '{conv_id}' not found.")
-    return JSONResponse({"object": "conversation", **entry})
-
-
-@app.delete("/v1/conversations/{conv_id}", tags=["conversations"])
-async def delete_conversation(conv_id: str, authorization: Optional[str] = Header(None)):
-    token   = _extract_token(authorization)
-    deleted = await _conv_delete(token, conv_id)
-    # تنظيف الجلسة المرتبطة أيضاً (آمن حتى لو لم توجد)
-    try:
-        await _clear_session(token, conv_id)
-    except Exception:
-        pass
-    if proxy_manager.enabled:
-        try:
-            async with proxy_manager._lock:
-                proxy_manager._session_proxy.pop(conv_id, None)
-        except Exception:
-            pass
-    if not deleted:
-        raise HTTPException(status_code=404, detail=f"Conversation '{conv_id}' not found.")
-    return JSONResponse({"object": "conversation.deleted", "id": conv_id, "deleted": True})
-
-
-@app.post("/v1/conversations/{conv_id}/clear", tags=["conversations"])
-async def clear_conversation(conv_id: str, authorization: Optional[str] = Header(None)):
-    token = _extract_token(authorization)
-    await _clear_session(token, conv_id)
-    if proxy_manager.enabled:
-        try:
-            async with proxy_manager._lock:
-                proxy_manager._session_proxy.pop(conv_id, None)
-        except Exception:
-            pass
-    entry = await _conv_update(token, conv_id)   # تحديث last_used
-    return JSONResponse({
-        "object":  "conversation.cleared",
-        "id":      conv_id,
-        "cleared": True,
-        "exists":  entry is not None,
-    })
-
-
-@app.post("/v1/chat/completions", tags=["chat"])
-async def chat_completions(
-    request:       Request,
-    authorization: Optional[str] = Header(None),
-):
-    token    = _extract_token(authorization)
-    body     = await request.json()
-    messages = body.get("messages", [])
-    tools    = body.get("tools", [])
-    do_stream = body.get("stream", False)
-    model    = body.get("model", QWEN_PROXY_ID)
-
-    # qwen-vision → qwen (نفس الـ backend)
-    if model == "qwen-vision":
-        model = QWEN_PROXY_ID
-
-    thinking = resolve_thinking(body)
-    extra    = resolve_extra(body, model)
-
-    explicit_conv_id = (
-        body.get("conversation_id")
-        or body.get("session_id")
-        or request.headers.get("x-conversation-id")
-        or request.headers.get("x-session-id")
-    )
-    conv_id = _compute_conv_id(messages, explicit_conv_id)
-
-    # [جديد v10.1] تسجيل/تحديث المحادثة في سجل المحادثات — لا يؤثر على أي سلوك موجود
-    await _conv_touch(token, conv_id, model)
-
-    if _is_regenerate_request(body):
-        log.info("Regenerate detected for conv=%s, clearing session", conv_id[:16])
-        await _clear_session(token, conv_id)
-        if proxy_manager.enabled:
-            async with proxy_manager._lock:
-                proxy_manager._session_proxy.pop(conv_id, None)
-
-    log.info("conv=%s model=%s msgs=%d thinking=%s extra=%s",
-             conv_id, model, len(messages), thinking, extra)
-
-    req_hash = _request_hash(messages, tools)
-    if await _is_duplicate(req_hash):
-        log.warning("Duplicate request (conv=%s) — skipping", conv_id)
-        raise HTTPException(status_code=429, detail="Duplicate request — please retry in a moment.")
-
-    backend = get_backend(model)
-    if backend is None:
-        backend = get_backend(QWEN_PROXY_ID)
-        if backend is None:
-            raise HTTPException(status_code=400, detail=f"No backend for model '{model}'.")
-
-    if do_stream:
-        async def event_stream():
-            async for chunk in backend.complete(token, messages, tools, thinking, conv_id, extra):
-                yield chunk
-        return StreamingResponse(event_stream(), media_type="text/event-stream")
-
-    # Non-streaming
-    full_content   = ""
-    finish_reason  = "stop"
-    tool_call_data = None
-
-    async for chunk in backend.complete(token, messages, tools, thinking, conv_id, extra):
-        if chunk.startswith("data: [DONE]"):
-            break
-        if not chunk.startswith("data: "):
-            continue
-        try:
-            obj = json.loads(chunk[6:])
-            if obj.get("type") == "thinking":
-                continue
-            choice = obj["choices"][0]
-            delta  = choice.get("delta", {})
-            fr     = choice.get("finish_reason")
-            if fr:
-                finish_reason = fr
-            if delta.get("tool_calls"):
-                tool_call_data = delta["tool_calls"][0]
-            elif delta.get("content"):
-                full_content += delta["content"]
-        except Exception:
-            continue
-
-    if tool_call_data:
-        return JSONResponse(make_tc_response({
-            "name": tool_call_data["function"]["name"],
-            "arguments": tool_call_data["function"]["arguments"],
-        }, model))
-    return JSONResponse(make_text_response(full_content, model))
-
-
-# ══════════════════════════════════════════════════════════
-# Image Generation (Qwen)
-# ══════════════════════════════════════════════════════════
-
-@app.post("/v1/images/generations", tags=["images"])
-async def image_generations(request: Request, authorization: Optional[str] = Header(None)):
-    token  = _extract_token(authorization)
-    body   = await request.json()
-    prompt = body.get("prompt", "")
-    size   = body.get("size", "1:1").replace("x", ":")
-    if not prompt:
-        raise HTTPException(status_code=400, detail="'prompt' is required.")
-
-    proxy_url = await proxy_manager.get_for_session("img_gen") if proxy_manager.enabled else None
-
-    async with _make_qwen_client(proxy_url) as client:
-        cid     = await _qwen_create_chat(token, client)
-        payload = _qwen_build_payload(cid, prompt, None, chat_type="t2i", size=size)
-        image_url: Optional[str] = None
-        async with client.stream("POST", f"{QWEN_BASE}/chat/completions", json=payload,
-                                  headers=_qwen_headers_chat(token, stream=True),
-                                  params={"chat_id": cid}, timeout=300) as resp:
-            async for raw_line in resp.aiter_lines():
-                if not raw_line or not raw_line.startswith("data: "):
-                    continue
-                ds = raw_line[6:].strip()
-                if ds == "[DONE]":
-                    break
-                if _qwen_is_antibot(raw_line) or _qwen_is_rate_limited(raw_line):
-                    raise HTTPException(status_code=429, detail="Qwen blocked or rate-limited.")
-                try:
-                    obj     = json.loads(ds)
-                    content = obj["choices"][0].get("delta", {}).get("content", "")
-                    if content.startswith("http"):
-                        image_url = content
-                except Exception:
-                    continue
-    if not image_url:
-        raise HTTPException(status_code=500, detail="No image URL returned.")
-    return JSONResponse({"created": int(time.time()), "data": [{"url": image_url}]})
-
-
-# ══════════════════════════════════════════════════════════
-# Error Handlers
-# ══════════════════════════════════════════════════════════
-
-@app.exception_handler(HTTPException)
-async def _http_err(request: Request, exc: HTTPException):
-    return JSONResponse(status_code=exc.status_code,
-                         content={"error": {"message": exc.detail, "type": "proxy_error",
-                                            "code": exc.status_code}})
-
-
-@app.exception_handler(Exception)
-async def _generic_err(request: Request, exc: Exception):
-    log.error("Unhandled: %s", exc, exc_info=True)
-    return JSONResponse(status_code=500,
-                         content={"error": {"message": str(exc), "type": "internal_error",
-                                            "code": 500}})
-
-
-# ══════════════════════════════════════════════════════════
-# Entry Point
-# ══════════════════════════════════════════════════════════
-
-if __name__ == "__main__":
-    import uvicorn
-    port = int(os.environ.get("PORT", 8000))
-    log.info("Starting Universal AI Proxy v10.1 on port %d", port)
-    uvicorn.run(app, host="0.0.0.0", port=port, log_level="info")
+            "capabilities":

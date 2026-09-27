@@ -1,18 +1,14 @@
-"""Universal AI Proxy  v10.4
+"""Universal AI Proxy  v10.1
 =========================
-التحسينات الجديدة عن v10.3:
-  ⑥ إصلاح الذاكرة في DeepAI:
-      - استعادة الأدوار الحقيقية (user/assistant) في chatHistory
-      - الذاكرة عبر الجلسة تعمل الآن (لا يعيد تعريف نفسه كل مرة)
-      - التذكير القوي يُضاف فقط لآخر رسالة مستخدم
-
-ملاحظة: كل التعديلات السابقة (①-⑤) كانت خاصة بنماذج DeepAI فقط.
+التحسينات الجديدة عن v10.0:
+  ③ دعم DeepAI كنماذج إضافية (15 نموذج) عبر backend موحّد
+      - مفتاح الوصول: "زيوس" (يُفعّل استخدام مفتاح DeepAI الداخلي)
+      - يدعم البروكسي عبر proxy_manager الموجود
+      - يستخدم نفس session store للجلسات
+      - يظهر في /v1/models و / health
 
 التحسينات السابقة:
-  ⑤ إصلاح تجاوب DeepAI باللغة الصحيحة
-  ④ إصلاح Agent لـ DeepAI (تذكير قوي + إزالة [SYSTEM])
-  ③ دعم DeepAI كنماذج إضافية (15 نموذج)
-  ① إصلاح Tool Call
+  ① إصلاح Tool Call: استخراج الأداة حتى لو كانت مدفونة في نص عادي
   ② دعم الصور (Vision/Multimodal) لـ Qwen
 """
 
@@ -642,209 +638,6 @@ def build_full_prompt(messages: List[Dict], tools: List[Dict]) -> str:
         parts.append(conv_text)
     parts.append("Assistant:")
     return "\n\n".join(parts)
-
-
-# ══════════════════════════════════════════════════════════
-# ④⑤ بناء prompt خاص بـ DeepAI (محفوظ للتوافق — لم يعد مستخدماً)
-# ══════════════════════════════════════════════════════════
-
-def build_deepai_prompt(messages: List[Dict], tools: List[Dict]) -> str:
-    """
-    نسخة سابقة — لم تعد مستخدمة. محفوظة فقط للتوافق.
-    استبدلتها بـ _build_deepai_history لاستعادة الذاكرة عبر الأدوار.
-    """
-    base = build_full_prompt(messages, tools)
-
-    if not tools:
-        return base
-
-    tool_names: List[str] = []
-    for t in tools:
-        fn = t.get("function") or t
-        n  = fn.get("name")
-        if n:
-            tool_names.append(n)
-
-    reminder = (
-        "\n\n"
-        "══════════════════════════════════════════════\n"
-        "⚠️  تعليمات نهائية — اقرأها قبل الرد:\n"
-        "⚠️  FINAL RULES — READ BEFORE ANSWERING:\n"
-        "══════════════════════════════════════════════\n"
-        "1) لغتك: أجب دائماً بنفس لغة رسالة المستخدم الأخيرة.\n"
-        "   Language: ALWAYS reply in the SAME language as the user's last message.\n"
-        "   إذا كتب بالعربية → أجب بالعربية. إذا كتب بالإنجليزية → أجب بالإنجليزية.\n"
-        "\n"
-        "2) مهمتك: أجب على سؤال المستخدم مباشرة. لا تتجاهله.\n"
-        "   Your job: ANSWER THE USER'S ACTUAL QUESTION. Do NOT ignore it.\n"
-        "\n"
-        "3) إذا كان الطلب يحتاج أداة، اجعل ردك كاملاً = سطر واحد فقط بصيغة:\n"
-        "   If a tool is required, your ENTIRE reply = ONE line only:\n"
-        "\n"
-        "   ACTION: tool_name|{\"param\": \"value\"}\n"
-        "\n"
-        "   أدوات متاحة (استخدم واحداً منها حرفياً): "
-        + ", ".join(tool_names) + "\n"
-        "   Available tool names (use EXACTLY one): "
-        + ", ".join(tool_names) + "\n"
-        "\n"
-        "   ❌ لا تكتب خطة. لا تقل 'سأستخدم...' أو 'I will use...'.\n"
-        "   ❌ DO NOT describe your plan. DO NOT write explanations.\n"
-        "   ❌ DO NOT echo [SYSTEM] or [/SYSTEM].\n"
-        "   ✅ فقط سطر ACTION واحد — لا شيء قبله ولا شيء بعده.\n"
-        "\n"
-        "4) إذا لم تحتج أداة → أجب على المستخدم بلغته بشكل طبيعي بدون سطر ACTION.\n"
-        "   If NO tool needed → reply normally to the user in their language.\n"
-        "══════════════════════════════════════════════\n"
-        "Assistant:"
-    )
-
-    if base.endswith("Assistant:"):
-        base = base[:-len("Assistant:")].rstrip() + reminder
-    else:
-        base += reminder
-
-    return base
-
-
-# ══════════════════════════════════════════════════════════
-# ⑥ بناء chatHistory خاص بـ DeepAI مع أدوار حقيقية
-# ══════════════════════════════════════════════════════════
-
-DEEPAI_REMINDER_TEMPLATE = (
-    "\n\n"
-    "══════════════════════════════════════════════\n"
-    "⚠️  تعليمات نهائية — اقرأها قبل الرد:\n"
-    "⚠️  FINAL RULES — READ BEFORE ANSWERING:\n"
-    "══════════════════════════════════════════════\n"
-    "1) لغتك: أجب دائماً بنفس لغة رسالة المستخدم الأخيرة.\n"
-    "   Language: ALWAYS reply in the SAME language as the user's last message.\n"
-    "   إذا كتب بالعربية → أجب بالعربية. إذا كتب بالإنجليزية → أجب بالإنجليزية.\n"
-    "\n"
-    "2) مهمتك: أجب على سؤال المستخدم مباشرة. لا تتجاهله.\n"
-    "   Your job: ANSWER THE USER'S ACTUAL QUESTION. Do NOT ignore it.\n"
-    "\n"
-    "3) إذا كان الطلب يحتاج أداة، اجعل ردك كاملاً = سطر واحد فقط بصيغة:\n"
-    "   If a tool is required, your ENTIRE reply = ONE line only:\n"
-    "\n"
-    "   ACTION: tool_name|{\"param\": \"value\"}\n"
-    "\n"
-    "   أدوات متاحة (استخدم واحداً منها حرفياً): {tool_list}\n"
-    "   Available tool names (use EXACTLY one): {tool_list}\n"
-    "\n"
-    "   ❌ لا تكتب خطة. لا تقل 'سأستخدم...' أو 'I will use...'.\n"
-    "   ❌ DO NOT describe your plan. DO NOT write explanations.\n"
-    "   ❌ DO NOT echo [SYSTEM] or [/SYSTEM].\n"
-    "   ✅ فقط سطر ACTION واحد — لا شيء قبله ولا شيء بعده.\n"
-    "\n"
-    "4) إذا لم تحتج أداة → أجب على المستخدم بلغته بشكل طبيعي بدون سطر ACTION.\n"
-    "   If NO tool needed → reply normally to the user in their language.\n"
-    "══════════════════════════════════════════════\n"
-)
-
-
-def _extract_text_content(content: Any) -> str:
-    """يستخرج نصاً من content قد يكون string أو list (OpenAI multimodal)."""
-    if isinstance(content, str):
-        return content
-    if isinstance(content, list):
-        parts = []
-        for c in content:
-            if isinstance(c, dict):
-                if c.get("type") == "text":
-                    parts.append(c.get("text", ""))
-                elif c.get("type") == "image_url":
-                    parts.append("[IMAGE]")
-        return " ".join(parts)
-    return str(content)
-
-
-def _build_deepai_history(messages: List[Dict], tools: List[Dict]) -> List[Dict]:
-    """
-    يبني chatHistory بصيغة DeepAI مع:
-      - أدوار حقيقية (user / assistant) ← هذا ما يجعل الذاكرة تعمل
-      - system + tools → مدموجة في أول رسالة user
-      - التذكير القوي → في آخر رسالة user فقط
-    """
-    history: List[Dict] = []
-
-    # ── 1) جمع system prompt + tools في أول رسالة user
-    sys_parts: List[str] = []
-    for m in messages:
-        if m.get("role") == "system":
-            c = m.get("content") or ""
-            if isinstance(c, list):
-                c = " ".join(p.get("text", "") for p in c if isinstance(p, dict))
-            if str(c).strip():
-                sys_parts.append(str(c).strip())
-
-    if tools:
-        sys_parts.append(tools_to_xml(tools))
-        sys_parts.append(TOOL_SYSTEM_SUFFIX)
-
-    if sys_parts:
-        history.append({
-            "role":    "user",
-            "content": "[SYSTEM]\n" + "\n\n".join(sys_parts).strip() + "\n[/SYSTEM]",
-        })
-        history.append({"role": "assistant", "content": "Understood. Ready."})
-
-    # ── 2) إضافة باقي الرسائل بأدوارها الحقيقية
-    for m in messages:
-        role = m.get("role", "user")
-        if role == "system":
-            continue
-
-        if role == "user":
-            history.append({
-                "role":    "user",
-                "content": _extract_text_content(m.get("content", "")),
-            })
-
-        elif role == "assistant":
-            tool_calls = m.get("tool_calls") or []
-            if tool_calls:
-                # نحوّل كل tool_call إلى سطر ACTION
-                for tc in tool_calls:
-                    fn      = tc.get("function", {})
-                    tc_name = fn.get("name", "")
-                    tc_args = fn.get("arguments", "{}")
-                    history.append({
-                        "role":    "assistant",
-                        "content": f"ACTION: {tc_name}|{tc_args}",
-                    })
-            else:
-                history.append({
-                    "role":    "assistant",
-                    "content": _extract_text_content(m.get("content", "")),
-                })
-
-        elif role in ("tool", "function"):
-            tool_name = m.get("name") or m.get("tool_call_id", "tool")
-            c         = m.get("content", "")
-            if isinstance(c, list):
-                c = str(c)
-            history.append({
-                "role":    "user",
-                "content": f"[TOOL RESULT: {tool_name}]\n{c}\n[/TOOL RESULT]",
-            })
-
-    # ── 3) إضافة التذكير القوي إلى آخر رسالة user
-    if tools:
-        tool_names = []
-        for t in tools:
-            fn = t.get("function") or t
-            n  = fn.get("name")
-            if n:
-                tool_names.append(n)
-        reminder = DEEPAI_REMINDER_TEMPLATE.replace("{tool_list}", ", ".join(tool_names))
-
-        if history and history[-1].get("role") == "user":
-            history[-1]["content"] = history[-1]["content"] + reminder
-        else:
-            history.append({"role": "user", "content": reminder.strip()})
-
-    return history
 
 
 def make_tc_response(tc: Dict, model: str) -> Dict:
@@ -1812,7 +1605,7 @@ def _deepai_extract_text(obj: Any) -> str:
 
 
 def _deepai_messages_to_history(messages: List[Dict]) -> List[Dict]:
-    """يحوّل رسائل OpenAI إلى chatHistory بصيغة DeepAI (محفوظ للتوافق)."""
+    """يحوّل رسائل OpenAI إلى chatHistory بصيغة DeepAI."""
     history: List[Dict] = []
     for m in messages:
         role = m.get("role", "user")
@@ -1842,9 +1635,8 @@ class DeepAIBackend(BaseBackend):
     """
     Backend موحّد لكل نماذج DeepAI.
     - يستخدم مفتاح DEEPAI_API_KEY الداخلي عندما يكون token == DEEPAI_MASTER_KEY ("زيوس")
-    - وإلا يستخدم الـ token الممرر كما هو
+    - وإلا يستخدم الـ token الممرر كما هو (يسمح بمفاتيح DeepAI مخصصة)
     - يعيد استخدام proxy_manager لتبديل البروكسي عند الحظر
-    - ⑥ يبني chatHistory بأدوار حقيقية (user/assistant) للحفاظ على الذاكرة
     """
 
     def __init__(self, model_name: str):
@@ -1876,8 +1668,7 @@ class DeepAIBackend(BaseBackend):
                 "deepai_sensitivity_id": sensitivity_id,
             })
 
-        # ── ⑥ بناء chatHistory بأدوار حقيقية
-        history = _build_deepai_history(messages, tools)
+        history = _deepai_messages_to_history(messages)
         if not history:
             return
 
@@ -1885,7 +1676,7 @@ class DeepAIBackend(BaseBackend):
 
         files = {
             "chat_style":                  (None, "chat"),
-            "language":                    (None, "ar"),
+            "language":                    (None, "en"),
             "chatHistory":                 (None, json.dumps(history, ensure_ascii=False)),
             "model":                       (None, self._model_name),
             "session_uuid":                (None, session_uuid),
@@ -1942,7 +1733,7 @@ class DeepAIBackend(BaseBackend):
 
             except (httpx.ProxyError, httpx.ConnectError, httpx.ConnectTimeout) as e:
                 stream_error = str(e)
-                if proxy_url and attempt < DEEPAI_BAN_CODES.__len__():
+                if proxy_url and attempt < MAX_DEEPAI_RETRIES:
                     log.warning("DeepAI: proxy error (%s) → switching", e)
                     await proxy_manager.mark_banned(proxy_url, conv_id)
                     continue
@@ -1958,9 +1749,6 @@ class DeepAIBackend(BaseBackend):
             assistant_reply = f"[DeepAI Error: {stream_error}]"
         if not assistant_reply:
             assistant_reply = "[DeepAI: empty response]"
-
-        # ── تنظيف أي تسريب لوسوم [SYSTEM]
-        assistant_reply = assistant_reply.replace("[SYSTEM]", "").replace("[/SYSTEM]", "")
 
         # ── فحص استدعاء الأداة
         tc = parse_tool_call(assistant_reply)
@@ -2047,7 +1835,7 @@ def _request_hash(messages: List[Dict], tools: List[Dict]) -> str:
 # FastAPI App
 # ══════════════════════════════════════════════════════════
 
-app = FastAPI(title="Universal AI Proxy", version="10.4.0", docs_url="/docs")
+app = FastAPI(title="Universal AI Proxy", version="10.1.0", docs_url="/docs")
 app.add_middleware(CORSMiddleware, allow_origins=["*"], allow_methods=["*"], allow_headers=["*"])
 
 
@@ -2062,7 +1850,7 @@ def _extract_token(authorization: Optional[str]) -> str:
 async def health():
     pm = proxy_manager
     return {
-        "status": "ok", "proxy": "Universal AI Proxy", "version": "10.4.0",
+        "status": "ok", "proxy": "Universal AI Proxy", "version": "10.1.0",
         "active_sessions": len(_sessions),
         "gemini_cookie_keys": len(_gemini_cookie_store),
         "backends": list(_BACKENDS.keys()),
@@ -2081,24 +1869,16 @@ async def health():
         },
         "deepai_models": DEEPAI_WORKING_MODELS,
         "deepai_access_key": DEEPAI_MASTER_KEY,
-        "new_in_v10_4": [
-            "⑥ DeepAI memory fix: real role-based chatHistory",
-            "⑥ Model remembers conversation across turns",
-            "⑥ Reminder is appended only to last user message",
-        ],
-        "new_in_v10_3": [
-            "⑤ DeepAI bilingual reminder (AR+EN)",
-            "⑤ language='ar' in DeepAI request",
-        ],
-        "new_in_v10_2": [
-            "④ DeepAI agent fix + strips leaked [SYSTEM]",
-        ],
         "new_in_v10_1": [
             "③ DeepAI support (15 models) with key زيوس",
+            "③ Uses shared proxy_manager for rotation",
+            "③ Exposes models in /v1/models and /",
         ],
         "new_in_v10": [
-            "① Tool Call fix",
-            "② Vision/Multimodal + OSS upload for Qwen",
+            "① Tool Call fix: extracts tool even when mixed with text",
+            "② Vision/Multimodal: Qwen accepts image_url in messages",
+            "② OSS upload: images auto-uploaded to Qwen OSS before chat",
+            "② /v1/models: vision capability declared for qwen",
         ],
     }
 
@@ -2137,6 +1917,7 @@ async def list_models():
             "capabilities": {"vision": False, "tool_choice": True},
             "context_window": 32000,
         },
+        # alias للـ vision (بعض clients تبحث عن -vision في الاسم)
         {
             "id":         "qwen-vision",
             "object":     "model",
@@ -2149,6 +1930,7 @@ async def list_models():
         },
     ]
 
+    # ── إضافة نماذج DeepAI تلقائياً ──
     for _m in DEEPAI_WORKING_MODELS:
         models.append({
             "id":         _m,
@@ -2166,6 +1948,7 @@ async def list_models():
     return {"object": "list", "data": models}
 
 
+# ── endpoint للقدرات (بعض clients تستعلمه مباشرة) ─────────────────
 @app.get("/v1/models/{model_id}", tags=["models"])
 async def get_model(model_id: str):
     vision_models = {"qwen", "qwen-vision"}
@@ -2198,6 +1981,7 @@ async def chat_completions(
     do_stream = body.get("stream", False)
     model    = body.get("model", QWEN_PROXY_ID)
 
+    # qwen-vision → qwen (نفس الـ backend)
     if model == "qwen-vision":
         model = QWEN_PROXY_ID
 
@@ -2239,6 +2023,7 @@ async def chat_completions(
                 yield chunk
         return StreamingResponse(event_stream(), media_type="text/event-stream")
 
+    # Non-streaming
     full_content   = ""
     finish_reason  = "stop"
     tool_call_data = None
@@ -2340,5 +2125,5 @@ async def _generic_err(request: Request, exc: Exception):
 if __name__ == "__main__":
     import uvicorn
     port = int(os.environ.get("PORT", 8000))
-    log.info("Starting Universal AI Proxy v10.4 on port %d", port)
+    log.info("Starting Universal AI Proxy v10.1 on port %d", port)
     uvicorn.run(app, host="0.0.0.0", port=port, log_level="info")

@@ -967,6 +967,14 @@ DEEPSEEK_PROXY_ID_DEFAULT = "deepseek-default"
 DEEPSEEK_CHAT_URL         = "https://chat.deepseek.com/api/v0/chat/completion"
 DEEPSEEK_SESSION_URL      = "https://chat.deepseek.com/api/v0/chat_session/create"
 RAILWAY_POW_URL           = "https://pow.up.railway.app/pow"
+NGROK_POW_URL             = "https://immunize-quintet-trimmer.ngrok-free.dev/get_pow"
+
+# ── قائمة خوادم POW — الأول هو الافتراضي، والثاني احتياطي
+#    إذا توقف الأول ينتقل تلقائياً للثاني
+POW_SERVERS: List[Dict[str, Any]] = [
+    {"name": "ngrok-primary",    "url": NGROK_POW_URL,   "bearer": True},
+    {"name": "railway-fallback", "url": RAILWAY_POW_URL, "bearer": False},
+]
 
 DEEPSEEK_SERVER_BUSY_PATTERNS = [
     "server is busy", "الخادم مشغول", "try again later", "حاول مرة أخرى",
@@ -1019,20 +1027,49 @@ def _ds_session_headers(token: str) -> Dict[str, str]:
 
 
 async def _ds_get_pow(token: str, client: httpx.AsyncClient) -> Tuple[str, Any]:
-    url = f"{RAILWAY_POW_URL}?authorization={token}"
-    try:
-        resp = await client.get(url, timeout=30)
-        if resp.status_code != 200:
-            resp = await client.get(RAILWAY_POW_URL, timeout=30)
-        data         = resp.json()
-        pow_response = data.get("x_ds_pow_response") or data.get("pow_response", "")
-        pow_data     = data.get("solved_json", None)
-        if not pow_response:
-            raise ValueError(f"POW response empty: {data}")
-        return pow_response, pow_data
-    except Exception as e:
-        log.error("DeepSeek: POW fetch failed: %s", e)
-        raise HTTPException(status_code=503, detail=f"POW server error: {e}")
+    """
+    يحاول جلب PoW من خوادم DEEPSEEK_POW_SERVERS بالترتيب.
+    - الأول هو الافتراضي (ngrok الجديد).
+    - إذا فشل ينتقل تلقائياً للاحتياطي (Railway).
+    - يحافظ على السلوك الأصلي لـ Railway (محاولة بدون باراميترات عند فشل الطلب الأساسي).
+    """
+    last_error: Optional[Exception] = None
+
+    for server in POW_SERVERS:
+        server_name = server["name"]
+        server_url  = server["url"]
+        use_bearer  = bool(server.get("bearer", False))
+
+        auth_value = f"Bearer {token}" if use_bearer else token
+        url = f"{server_url}?authorization={auth_value}"
+
+        try:
+            resp = await client.get(url, timeout=30)
+            if resp.status_code != 200:
+                # الاحتفاظ بالسلوك الأصلي لخادم Railway: محاولة بدون باراميترات
+                if server_url == RAILWAY_POW_URL:
+                    resp = await client.get(RAILWAY_POW_URL, timeout=30)
+
+            if resp.status_code != 200:
+                raise ValueError(f"HTTP {resp.status_code}")
+
+            data         = resp.json()
+            pow_response = data.get("x_ds_pow_response") or data.get("pow_response", "")
+            pow_data     = data.get("solved_json", None)
+
+            if not pow_response:
+                raise ValueError(f"POW response empty: {data}")
+
+            log.info("DeepSeek: POW fetched from '%s'", server_name)
+            return pow_response, pow_data
+
+        except Exception as e:
+            last_error = e
+            log.warning("DeepSeek: POW server '%s' failed (%s) — trying next", server_name, e)
+            continue
+
+    log.error("DeepSeek: all POW servers failed: %s", last_error)
+    raise HTTPException(status_code=503, detail=f"All POW servers failed: {last_error}")
 
 
 async def _ds_create_session(token: str, client: httpx.AsyncClient) -> str:

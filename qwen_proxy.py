@@ -1,15 +1,16 @@
-"""Universal AI Proxy  v10.1
+"""
+Universal AI Proxy  v10.0
 =========================
-التحسينات الجديدة عن v10.0:
-  ③ دعم DeepAI كنماذج إضافية (15 نموذج) عبر backend موحّد
-      - مفتاح الوصول: "زيوس" (يُفعّل استخدام مفتاح DeepAI الداخلي)
-      - يدعم البروكسي عبر proxy_manager الموجود
-      - يستخدم نفس session store للجلسات
-      - يظهر في /v1/models و / health
-
-التحسينات السابقة:
+التحسينات الجديدة عن v9:
   ① إصلاح Tool Call: استخراج الأداة حتى لو كانت مدفونة في نص عادي
-  ② دعم الصور (Vision/Multimodal) لـ Qwen
+      - parse_tool_call تبحث في كامل النص (re.search بدل re.match)
+      - has_tool_call() مساعدة تكشف وجود أداة في أي مكان
+      - clean_text() لا تُشغَّل إذا وُجدت أداة
+  ② دعم الصور (Vision/Multimodal):
+      - رفع الصور لـ Qwen OSS تلقائياً
+      - قبول image_url في messages بصيغة OpenAI
+      - /v1/models يُعلن vision: true لنموذج qwen
+      - capabilities endpoint جديد
 """
 
 from __future__ import annotations
@@ -967,14 +968,6 @@ DEEPSEEK_PROXY_ID_DEFAULT = "deepseek-default"
 DEEPSEEK_CHAT_URL         = "https://chat.deepseek.com/api/v0/chat/completion"
 DEEPSEEK_SESSION_URL      = "https://chat.deepseek.com/api/v0/chat_session/create"
 RAILWAY_POW_URL           = "https://pow.up.railway.app/pow"
-NGROK_POW_URL             = "https://immunize-quintet-trimmer.ngrok-free.dev/get_pow"
-
-# ── قائمة خوادم POW — الأول هو الافتراضي، والثاني احتياطي
-#    إذا توقف الأول ينتقل تلقائياً للثاني
-POW_SERVERS: List[Dict[str, Any]] = [
-    {"name": "ngrok-primary",    "url": NGROK_POW_URL,   "bearer": True},
-    {"name": "railway-fallback", "url": RAILWAY_POW_URL, "bearer": False},
-]
 
 DEEPSEEK_SERVER_BUSY_PATTERNS = [
     "server is busy", "الخادم مشغول", "try again later", "حاول مرة أخرى",
@@ -1027,49 +1020,20 @@ def _ds_session_headers(token: str) -> Dict[str, str]:
 
 
 async def _ds_get_pow(token: str, client: httpx.AsyncClient) -> Tuple[str, Any]:
-    """
-    يحاول جلب PoW من خوادم DEEPSEEK_POW_SERVERS بالترتيب.
-    - الأول هو الافتراضي (ngrok الجديد).
-    - إذا فشل ينتقل تلقائياً للاحتياطي (Railway).
-    - يحافظ على السلوك الأصلي لـ Railway (محاولة بدون باراميترات عند فشل الطلب الأساسي).
-    """
-    last_error: Optional[Exception] = None
-
-    for server in POW_SERVERS:
-        server_name = server["name"]
-        server_url  = server["url"]
-        use_bearer  = bool(server.get("bearer", False))
-
-        auth_value = f"Bearer {token}" if use_bearer else token
-        url = f"{server_url}?authorization={auth_value}"
-
-        try:
-            resp = await client.get(url, timeout=30)
-            if resp.status_code != 200:
-                # الاحتفاظ بالسلوك الأصلي لخادم Railway: محاولة بدون باراميترات
-                if server_url == RAILWAY_POW_URL:
-                    resp = await client.get(RAILWAY_POW_URL, timeout=30)
-
-            if resp.status_code != 200:
-                raise ValueError(f"HTTP {resp.status_code}")
-
-            data         = resp.json()
-            pow_response = data.get("x_ds_pow_response") or data.get("pow_response", "")
-            pow_data     = data.get("solved_json", None)
-
-            if not pow_response:
-                raise ValueError(f"POW response empty: {data}")
-
-            log.info("DeepSeek: POW fetched from '%s'", server_name)
-            return pow_response, pow_data
-
-        except Exception as e:
-            last_error = e
-            log.warning("DeepSeek: POW server '%s' failed (%s) — trying next", server_name, e)
-            continue
-
-    log.error("DeepSeek: all POW servers failed: %s", last_error)
-    raise HTTPException(status_code=503, detail=f"All POW servers failed: {last_error}")
+    url = f"{RAILWAY_POW_URL}?authorization={token}"
+    try:
+        resp = await client.get(url, timeout=30)
+        if resp.status_code != 200:
+            resp = await client.get(RAILWAY_POW_URL, timeout=30)
+        data         = resp.json()
+        pow_response = data.get("x_ds_pow_response") or data.get("pow_response", "")
+        pow_data     = data.get("solved_json", None)
+        if not pow_response:
+            raise ValueError(f"POW response empty: {data}")
+        return pow_response, pow_data
+    except Exception as e:
+        log.error("DeepSeek: POW fetch failed: %s", e)
+        raise HTTPException(status_code=503, detail=f"POW server error: {e}")
 
 
 async def _ds_create_session(token: str, client: httpx.AsyncClient) -> str:
@@ -1511,6 +1475,139 @@ async def _gemini_send_message(
     return full_text, new_conv if new_conv.get("conversation_id") else None
 
 
+# ══════════════════════════════════════════════════════════
+# NEW: Gemini Fallback (cookie-less mode)
+# يُستخدَم تلقائياً عند فشل الكوكيز في الوضع الأساسي
+# ══════════════════════════════════════════════════════════
+
+GEMINI_FALLBACK_URL = (
+    "https://gemini.google.com/_/BardChatUi/data/"
+    "assistant.lamda.BardFrontendService/StreamGenerate"
+)
+GEMINI_FALLBACK_BL  = "boq_assistant-bard-web-server_20240519.16_p0"
+GEMINI_FALLBACK_MODEL_JSPB = '[1,null,null,null,"35609594dbe934d8"]'
+
+GEMINI_FALLBACK_HEADERS = {
+    "authority":       "gemini.google.com",
+    "accept":          "*/*",
+    "accept-language": "en-US,en;q=0.9",
+    "origin":          "https://gemini.google.com",
+    "referer":         "https://gemini.google.com/",
+    "user-agent":      (
+        "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
+        "AppleWebKit/537.36 (KHTML, like Gecko) "
+        "Chrome/123.0 Safari/537.36"
+    ),
+    "x-same-domain":   "1",
+    "content-type":    "application/x-www-form-urlencoded;charset=UTF-8",
+}
+
+
+async def _gemini_fallback_get_tokens(
+    client: httpx.AsyncClient,
+) -> Tuple[Optional[str], Optional[str]]:
+    """
+    وضع cookie-less: نطلب gemini.google.com مباشرة بدون كوكيز المستخدم،
+    ونستخرج SNlM0e + FdrFJe من الرد. الـ AsyncClient يحتفظ بالكوكيز
+    المؤقتة تلقائياً في الـ jar الخاص به لإعادة استخدامها في POST.
+    """
+    try:
+        r = await client.get(
+            "https://gemini.google.com",
+            headers=GEMINI_FALLBACK_HEADERS,
+            timeout=30,
+            follow_redirects=True,
+        )
+        t = r.text
+        k1 = None
+        k2 = None
+        q1 = re.search(r'"SNlM0e":"(.*?)"', t)
+        if q1:
+            k1 = q1.group(1)
+        q2 = re.search(r'"FdrFJe":"([\d-]+)"', t)
+        if q2:
+            k2 = q2.group(1)
+        if not k1:
+            log.error("Gemini fallback: SNlM0e not found in anonymous response")
+        else:
+            log.info("Gemini fallback: tokens OK snlm0e=%s fdrfje=%s", k1[:8], k2)
+        return k1, k2
+    except Exception as e:
+        log.error("Gemini fallback: token fetch failed: %s", e)
+        return None, None
+
+
+async def _gemini_fallback_send(
+    client: httpx.AsyncClient,
+    prompt: str,
+    snlm0e: str,
+    fdrfje: str,
+) -> str:
+    """
+    إرسال رسالة في وضع cookie-less — بدون أي حالة محادثة، كل طلب مستقل.
+    """
+    import random
+
+    d1 = [
+        [prompt, 0, None, [], None, None, 0],
+        ["en"],
+        [None, None, None, None, None, []],
+        None,
+        None,
+        None,
+        [],
+        0,
+        [],
+        [],
+        1,
+        0,
+    ]
+
+    payload = {
+        "at":     snlm0e,
+        "f.req":  json.dumps([None, json.dumps(d1)]),
+    }
+
+    params = {
+        "bl":     GEMINI_FALLBACK_BL,
+        "hl":     "en",
+        "_reqid": random.randint(10000, 99999),
+        "rt":     "c",
+        "f.sid":  fdrfje,
+    }
+
+    h2 = dict(GEMINI_FALLBACK_HEADERS)
+    h2["x-goog-ext-525001261-jspb"] = GEMINI_FALLBACK_MODEL_JSPB
+
+    full_text = ""
+    try:
+        async with client.stream(
+            "POST", GEMINI_FALLBACK_URL,
+            params=params, data=payload,
+            headers=h2, timeout=REQUEST_TIMEOUT,
+        ) as resp:
+            async for c in resp.aiter_lines():
+                if not c:
+                    continue
+                try:
+                    a1 = json.loads(c)
+                    if not isinstance(a1, list):
+                        continue
+                    if not a1 or len(a1[0]) < 3:
+                        continue
+                    c2 = json.loads(a1[0][2])
+                    t1 = c2[4][0][1][0]
+                    if t1 and t1.startswith(full_text):
+                        full_text = t1
+                except Exception:
+                    pass
+    except Exception as e:
+        log.error("Gemini fallback stream error: %s", e)
+        return f"[Gemini Error: {e}]"
+
+    return full_text
+
+
 class GeminiBackend(BaseBackend):
     @property
     def model_id(self) -> str:
@@ -1536,11 +1633,36 @@ class GeminiBackend(BaseBackend):
                 cookies = await _gemini_get_cookies(cookie_key, token)
                 snlm0e, fdrfje = await _gemini_get_tokens(cookies, client, cookie_key)
 
+                # ── عند فشل الكوكيز → نتحوّل تلقائياً إلى الوضع cookie-less
                 if not snlm0e:
-                    err_msg = "[Gemini Error: failed to get session tokens — check cookies]"
-                    yield sse_chunk(err_msg, model=self.model_id)
-                    yield sse_chunk(model=self.model_id, finish=True)
-                    yield "data: [DONE]\n\n"
+                    log.warning("Gemini: cookie-based tokens failed → switching to cookie-less fallback")
+
+                    fb_snlm0e, fb_fdrfje = await _gemini_fallback_get_tokens(client)
+
+                    if not fb_snlm0e:
+                        err_msg = "[Gemini Error: failed to get session tokens — cookies & fallback both failed]"
+                        yield sse_chunk(err_msg, model=self.model_id)
+                        yield sse_chunk(model=self.model_id, finish=True)
+                        yield "data: [DONE]\n\n"
+                        return
+
+                    fb_text = await _gemini_fallback_send(
+                        client, prompt, fb_snlm0e, fb_fdrfje
+                    )
+
+                    # ── ① نفس منطق Tool Call
+                    tc = parse_tool_call(fb_text)
+                    if tc:
+                        call_id = f"call_{uuid.uuid4().hex[:24]}"
+                        yield sse_chunk(tc=tc, model=self.model_id, call_id=call_id)
+                        yield sse_chunk(tc=tc, model=self.model_id, call_id=call_id, finish=True)
+                        yield "data: [DONE]\n\n"
+                    else:
+                        txt = clean_text(fb_text) or "[Gemini: empty response]"
+                        for i in range(0, max(len(txt), 1), 40):
+                            yield sse_chunk(txt[i:i+40], model=self.model_id)
+                        yield sse_chunk(model=self.model_id, finish=True)
+                        yield "data: [DONE]\n\n"
                     return
 
                 gemini_conv = None
@@ -1575,233 +1697,6 @@ class GeminiBackend(BaseBackend):
 
 
 register_backend(GeminiBackend())
-
-
-# ══════════════════════════════════════════════════════════
-# BACKEND 5+: DeepAI (متعدد النماذج) — إضافة جديدة
-# ══════════════════════════════════════════════════════════
-
-DEEPAI_MASTER_KEY = "زيوس"
-DEEPAI_API_KEY    = "tryit-67660760637-46a82fd685adad8b75f28cb8ddbad1fc"
-DEEPAI_URL        = "https://api.deepai.org/hacking_is_a_serious_crime"
-
-DEEPAI_WORKING_MODELS: List[str] = [
-    "standard",
-    "glm-5.3-flash",
-    "qwen-3.8-flash",
-    "gemini-3.1-pro",
-    "deepseek-v4-flash",
-    "deepseek-v3.2",
-    "gpt-6-luna",
-    "gpt-5.6-luna",
-    "tencent-hy3",
-    "gpt-oss-120b",
-    "gemma-4",
-    "llama-3.3-70b-instruct",
-    "llama-3.1-8b-instant",
-    "gpt-4o-mini",
-    "gemini-2.5-flash-lite",
-]
-
-DEEPAI_HEADERS_TEMPLATE: Dict[str, str] = {
-    "host": "api.deepai.org",
-    "sec-ch-ua": '"Chromium";v="137", "Not/A)Brand";v="24"',
-    "sec-ch-ua-mobile": "?1",
-    "user-agent": (
-        "Mozilla/5.0 (Linux; Android 10; K) AppleWebKit/537.36 "
-        "(KHTML, like Gecko) Chrome/137.0.0.0 Mobile Safari/537.36"
-    ),
-    "sec-ch-ua-platform": '"Android"',
-    "accept": "text/event-stream",
-    "origin": "https://deepai.org",
-    "referer": "https://deepai.org/",
-    "sec-fetch-site": "same-site",
-    "sec-fetch-mode": "cors",
-    "sec-fetch-dest": "empty",
-    "accept-language": "ar-EG,ar;q=0.9,en-US;q=0.8,en;q=0.7",
-}
-
-DEEPAI_BAN_CODES = {403, 429, 451}
-
-
-def _deepai_extract_text(obj: Any) -> str:
-    """استخراج النص من استجابة JSON الخاصة بـ DeepAI."""
-    if not isinstance(obj, dict):
-        return ""
-    try:
-        t = (
-            obj.get("choices", [{}])[0].get("delta", {}).get("content")
-            or obj.get("delta")
-            or obj.get("content")
-            or obj.get("text")
-            or obj.get("output")
-        )
-        return t if isinstance(t, str) else ""
-    except Exception:
-        return ""
-
-
-def _deepai_messages_to_history(messages: List[Dict]) -> List[Dict]:
-    """يحوّل رسائل OpenAI إلى chatHistory بصيغة DeepAI."""
-    history: List[Dict] = []
-    for m in messages:
-        role = m.get("role", "user")
-        if role not in ("user", "assistant", "system"):
-            continue
-        content = m.get("content", "")
-        if isinstance(content, list):
-            parts = []
-            for c in content:
-                if isinstance(c, dict) and c.get("type") == "text":
-                    parts.append(c.get("text", ""))
-            content = " ".join(parts)
-        history.append({"role": role, "content": str(content)})
-    return history
-
-
-def _make_deepai_client(proxy_url: Optional[str] = None) -> httpx.AsyncClient:
-    if proxy_url:
-        return httpx.AsyncClient(
-            proxies={"http://": proxy_url, "https://": proxy_url},
-            timeout=REQUEST_TIMEOUT,
-        )
-    return httpx.AsyncClient(timeout=REQUEST_TIMEOUT)
-
-
-class DeepAIBackend(BaseBackend):
-    """
-    Backend موحّد لكل نماذج DeepAI.
-    - يستخدم دائماً مفتاح DEEPAI_API_KEY الثابت في الكود،
-      ويتجاهل أي token يُمرَّر من العميل.
-    - يعيد استخدام proxy_manager لتبديل البروكسي عند الحظر.
-    """
-
-    def __init__(self, model_name: str):
-        self._model_name = model_name
-
-    @property
-    def model_id(self) -> str:
-        return self._model_name
-
-    async def complete(self, token, messages, tools, thinking, conv_id, extra) -> AsyncIterator[str]:
-        await _evict_old_sessions()
-
-        # ── تجاهل أي token قادم من العميل، واستخدام المفتاح الثابت دائماً
-        api_key = DEEPAI_API_KEY
-
-        # ── جلب/إنشاء جلسة خاصة بهذه المحادثة
-        sess = await _get_session(token, conv_id)
-        if sess and sess.get("deepai_uuid"):
-            session_uuid   = sess["deepai_uuid"]
-            sensitivity_id = sess["deepai_sensitivity_id"]
-        else:
-            session_uuid   = str(uuid.uuid4())
-            sensitivity_id = str(uuid.uuid4())
-            await _set_session(token, conv_id, {
-                "deepai_uuid":           session_uuid,
-                "deepai_sensitivity_id": sensitivity_id,
-            })
-
-        history = _deepai_messages_to_history(messages)
-        if not history:
-            return
-
-        headers = {**DEEPAI_HEADERS_TEMPLATE, "api-key": api_key}
-
-        files = {
-            "chat_style":                  (None, "chat"),
-            "language":                    (None, "en"),
-            "chatHistory":                 (None, json.dumps(history, ensure_ascii=False)),
-            "model":                       (None, self._model_name),
-            "session_uuid":                (None, session_uuid),
-            "sensitivity_request_id":      (None, sensitivity_id),
-            "tool_activity_support":       (None, "1"),
-            "thinking_image_tool_support": (None, "1"),
-            "hacker_is_stinky":            (None, "very_stinky"),
-            "enabled_tools":               (None, '["image_generator","image_editor"]'),
-        }
-
-        MAX_DEEPAI_RETRIES = 2
-        assistant_reply    = ""
-        stream_error: Optional[str] = None
-
-        for attempt in range(MAX_DEEPAI_RETRIES + 1):
-            proxy_url = await proxy_manager.get_for_session(conv_id) if proxy_manager.enabled else None
-            try:
-                async with _make_deepai_client(proxy_url) as client:
-                    async with client.stream("POST", DEEPAI_URL, headers=headers, files=files) as resp:
-                        if resp.status_code in DEEPAI_BAN_CODES and proxy_url and attempt < MAX_DEEPAI_RETRIES:
-                            log.warning("DeepAI: HTTP %d → switching proxy", resp.status_code)
-                            await proxy_manager.mark_banned(proxy_url, conv_id)
-                            await _clear_session(token, conv_id)
-                            assistant_reply = ""
-                            continue
-
-                        ctype  = resp.headers.get("content-type", "")
-                        is_sse = "text/event-stream" in ctype
-
-                        buffer = ""
-                        async for chunk in resp.aiter_text():
-                            if not chunk:
-                                continue
-                            if is_sse:
-                                buffer += chunk
-                                while "\n" in buffer:
-                                    line, buffer = buffer.split("\n", 1)
-                                    line = line.strip()
-                                    if not line or not line.startswith("data:"):
-                                        continue
-                                    payload = line[5:].strip()
-                                    if payload == "[DONE]":
-                                        continue
-                                    try:
-                                        obj  = json.loads(payload)
-                                        text = _deepai_extract_text(obj)
-                                        if text:
-                                            assistant_reply += text
-                                    except json.JSONDecodeError:
-                                        assistant_reply += payload
-                            else:
-                                assistant_reply += chunk
-                break
-
-            except (httpx.ProxyError, httpx.ConnectError, httpx.ConnectTimeout) as e:
-                stream_error = str(e)
-                if proxy_url and attempt < MAX_DEEPAI_RETRIES:
-                    log.warning("DeepAI: proxy error (%s) → switching", e)
-                    await proxy_manager.mark_banned(proxy_url, conv_id)
-                    continue
-                log.error("DeepAI: all proxy attempts failed: %s", e)
-                break
-            except Exception as e:
-                stream_error = str(e)
-                log.error("DeepAI stream error: %s", e, exc_info=True)
-                break
-
-        # ── إخراج SSE
-        if stream_error and not assistant_reply:
-            assistant_reply = f"[DeepAI Error: {stream_error}]"
-        if not assistant_reply:
-            assistant_reply = "[DeepAI: empty response]"
-
-        # ── فحص استدعاء الأداة
-        tc = parse_tool_call(assistant_reply)
-        if tc:
-            call_id = f"call_{uuid.uuid4().hex[:24]}"
-            yield sse_chunk(tc=tc, model=self.model_id, call_id=call_id)
-            yield sse_chunk(tc=tc, model=self.model_id, call_id=call_id, finish=True)
-            yield "data: [DONE]\n\n"
-        else:
-            txt = clean_text(assistant_reply) or "[DeepAI: empty response]"
-            for i in range(0, max(len(txt), 1), 40):
-                yield sse_chunk(txt[i:i+40], model=self.model_id)
-            yield sse_chunk(model=self.model_id, finish=True)
-            yield "data: [DONE]\n\n"
-
-
-# تسجيل كل نماذج DeepAI في السجل
-for _deepai_model in DEEPAI_WORKING_MODELS:
-    register_backend(DeepAIBackend(_deepai_model))
 
 
 # ══════════════════════════════════════════════════════════
@@ -1869,7 +1764,7 @@ def _request_hash(messages: List[Dict], tools: List[Dict]) -> str:
 # FastAPI App
 # ══════════════════════════════════════════════════════════
 
-app = FastAPI(title="Universal AI Proxy", version="10.1.0", docs_url="/docs")
+app = FastAPI(title="Universal AI Proxy", version="10.0.0", docs_url="/docs")
 app.add_middleware(CORSMiddleware, allow_origins=["*"], allow_methods=["*"], allow_headers=["*"])
 
 
@@ -1884,7 +1779,7 @@ def _extract_token(authorization: Optional[str]) -> str:
 async def health():
     pm = proxy_manager
     return {
-        "status": "ok", "proxy": "Universal AI Proxy", "version": "10.1.0",
+        "status": "ok", "proxy": "Universal AI Proxy", "version": "10.0.0",
         "active_sessions": len(_sessions),
         "gemini_cookie_keys": len(_gemini_cookie_store),
         "backends": list(_BACKENDS.keys()),
@@ -1898,39 +1793,34 @@ async def health():
             "qwen":             "Qwen3.8-max (vision + tools + proxy rotation)",
             "deepseek":         "DeepSeek Expert (text only, auto-fallback)",
             "deepseek-default": "DeepSeek Default (text only, auto-fallback)",
-            "gemini":           "Gemini (text only, cookies-based)",
-            "deepai":           "DeepAI multi-model (15 models, any key accepted)",
+            "gemini":           "Gemini (cookies-based + cookie-less auto-fallback)",
         },
-        "deepai_models": DEEPAI_WORKING_MODELS,
-        "deepai_access_key": DEEPAI_MASTER_KEY,
-        "new_in_v10_1": [
-            "③ DeepAI support (15 models) with key زيوس",
-            "③ Uses shared proxy_manager for rotation",
-            "③ Exposes models in /v1/models and /",
-        ],
         "new_in_v10": [
             "① Tool Call fix: extracts tool even when mixed with text",
             "② Vision/Multimodal: Qwen accepts image_url in messages",
             "② OSS upload: images auto-uploaded to Qwen OSS before chat",
             "② /v1/models: vision capability declared for qwen",
+            "③ Gemini: auto-fallback to cookie-less mode when cookies fail",
         ],
     }
 
 
-# ── /v1/models يُعلن قدرات Vision + نماذج DeepAI ──────────────────
+# ── ② /v1/models يُعلن قدرات Vision ─────────────────────────────────
 @app.get("/v1/models", tags=["models"])
 async def list_models():
-    models: List[Dict[str, Any]] = [
+    models = [
         {
             "id":         "qwen",
             "object":     "model",
             "created":    1700000000,
             "owned_by":   "qwen",
+            # إعلان قدرة Vision لـ Open Minis وكل OpenAI-compatible clients
             "capabilities": {
                 "vision":             True,
                 "tool_choice":        True,
                 "parallel_tool_calls": False,
             },
+            # بعض clients تقرأ هذه الحقول مباشرة
             "supports_vision":      True,
             "supports_tools":       True,
             "multimodal":           True,
@@ -1963,35 +1853,18 @@ async def list_models():
             "context_window":  128000,
         },
     ]
-
-    # ── إضافة نماذج DeepAI تلقائياً ──
-    for _m in DEEPAI_WORKING_MODELS:
-        models.append({
-            "id":         _m,
-            "object":     "model",
-            "created":    1700000000,
-            "owned_by":   "deepai",
-            "capabilities": {
-                "vision":             False,
-                "tool_choice":        True,
-                "parallel_tool_calls": False,
-            },
-            "context_window": 32000,
-        })
-
     return {"object": "list", "data": models}
 
 
-# ── endpoint للقدرات (بعض clients تستعلمه مباشرة) ─────────────────
+# ── ② endpoint للقدرات (بعض clients تستعلمه مباشرة) ─────────────────
 @app.get("/v1/models/{model_id}", tags=["models"])
 async def get_model(model_id: str):
     vision_models = {"qwen", "qwen-vision"}
-    is_deepai     = model_id in DEEPAI_WORKING_MODELS
     return {
         "id":         model_id,
         "object":     "model",
         "created":    1700000000,
-        "owned_by":   "deepai" if is_deepai else "proxy",
+        "owned_by":   "proxy",
         "capabilities": {
             "vision":             model_id in vision_models,
             "tool_choice":        True,
@@ -1999,7 +1872,7 @@ async def get_model(model_id: str):
         },
         "supports_vision": model_id in vision_models,
         "multimodal":      model_id in vision_models,
-        "context_window":  128000 if model_id in vision_models else (32000 if is_deepai else 64000),
+        "context_window":  128000 if model_id in vision_models else 64000,
     }
 
 
@@ -2159,5 +2032,5 @@ async def _generic_err(request: Request, exc: Exception):
 if __name__ == "__main__":
     import uvicorn
     port = int(os.environ.get("PORT", 8000))
-    log.info("Starting Universal AI Proxy v10.1 on port %d", port)
+    log.info("Starting Universal AI Proxy v10.0 on port %d", port)
     uvicorn.run(app, host="0.0.0.0", port=port, log_level="info")

@@ -1671,9 +1671,9 @@ def _make_deepai_client(proxy_url: Optional[str] = None) -> httpx.AsyncClient:
 class DeepAIBackend(BaseBackend):
     """
     Backend موحّد لكل نماذج DeepAI.
-    - يستخدم مفتاح DEEPAI_API_KEY الداخلي عندما يكون token == DEEPAI_MASTER_KEY ("زيوس")
-    - وإلا يستخدم الـ token الممرر كما هو (يسمح بمفاتيح DeepAI مخصصة)
-    - يعيد استخدام proxy_manager لتبديل البروكسي عند الحظر
+    - يستخدم دائماً مفتاح DEEPAI_API_KEY الثابت في الكود،
+      ويتجاهل أي token يُمرَّر من العميل.
+    - يعيد استخدام proxy_manager لتبديل البروكسي عند الحظر.
     """
 
     def __init__(self, model_name: str):
@@ -1686,11 +1686,8 @@ class DeepAIBackend(BaseBackend):
     async def complete(self, token, messages, tools, thinking, conv_id, extra) -> AsyncIterator[str]:
         await _evict_old_sessions()
 
-        # ── اختيار مفتاح API الفعلي
-        if not token or token == DEEPAI_MASTER_KEY:
-            api_key = DEEPAI_API_KEY
-        else:
-            api_key = token
+        # ── تجاهل أي token قادم من العميل، واستخدام المفتاح الثابت دائماً
+        api_key = DEEPAI_API_KEY
 
         # ── جلب/إنشاء جلسة خاصة بهذه المحادثة
         sess = await _get_session(token, conv_id)
@@ -1902,7 +1899,7 @@ async def health():
             "deepseek":         "DeepSeek Expert (text only, auto-fallback)",
             "deepseek-default": "DeepSeek Default (text only, auto-fallback)",
             "gemini":           "Gemini (text only, cookies-based)",
-            "deepai":           "DeepAI multi-model (15 models, key: زيوس)",
+            "deepai":           "DeepAI multi-model (15 models, any key accepted)",
         },
         "deepai_models": DEEPAI_WORKING_MODELS,
         "deepai_access_key": DEEPAI_MASTER_KEY,
